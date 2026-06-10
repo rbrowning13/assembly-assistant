@@ -1,0 +1,75 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Assembly Assistant</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div class="app" id="appShell">
+    <aside class="nav">
+      <div class="brand">
+        <div class="brand-mark">A</div>
+        <div class="brand-text">Assembly Assistant</div>
+      </div>
+      <div class="nav-items">
+        <button data-page="jobs" onclick="go('jobs')"><span>▦</span><span class="nav-label">Jobs</span></button>
+        <button data-page="sections" onclick="go('sections')"><span>▣</span><span class="nav-label">Sections</span></button>
+        <button data-page="package" onclick="go('package')"><span>↕</span><span class="nav-label">Package</span></button>
+        <button data-page="settings" onclick="go('settings')"><span>⚙</span><span class="nav-label">Settings</span></button>
+      </div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <div class="toolbar-left">
+          <button class="icon" onclick="toggleNav()" title="Toggle navigation">☰</button>
+          <h1 id="pageTitle">Jobs</h1>
+        </div>
+        <div class="top-actions" id="topActions"></div>
+      </div>
+      <div class="content" id="root"></div>
+    </main>
+  </div>
+
+  <div class="modal-backdrop" id="jobModal">
+    <div class="modal">
+      <div class="modal-head">
+        <strong>Start Job</strong>
+        <button class="icon" onclick="closeJobModal()">×</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-grid">
+          <div class="field"><label>Job name</label><input id="newName" value="Lego SF-24 cockpit module"></div>
+          <div class="field"><label>Product</label><input id="newProduct" value="F1 SF-24"></div>
+          <div class="field"><label>Work area</label><input id="newArea" value="Prototype bench"></div>
+          <div class="field"><label>Station</label><input id="newStation" value="Station B"></div>
+          <div class="field"><label>Expected steps</label><input id="newExpectedSteps" type="number" min="1" max="200" placeholder="Optional"></div>
+          <div class="field"><label>Frame focus</label><select id="newFocusArea"><option value="center">Center work area</option><option value="full">Full frame</option></select></div>
+          <div class="field"><label>Processing</label><select id="newProfile"><option>Standard</option><option>Fast</option><option>Deep</option></select></div>
+        </div>
+        <div style="height:12px"></div>
+        <div class="file-box">
+          <strong>Files</strong>
+          <input id="newFiles" type="file" multiple>
+          <div class="subtle">Video, audio, images, PDFs, and scans can be added to the processing set.</div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button onclick="closeJobModal()">Cancel</button>
+        <button class="primary" onclick="createJob()">Create and Go</button>
+      </div>
+    </div>
+  </div>
+  <div class="image-zoom-backdrop" id="imageZoom" onclick="closeImageZoom()">
+    <div class="image-zoom-panel">
+      <img id="imageZoomImg" alt="">
+      <div id="imageZoomLabel" class="subtle"></div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

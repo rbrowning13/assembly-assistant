@@ -14,16 +14,17 @@ The first product focus is processing quality and section writing. Reviews, perm
 
 Built:
 
-- Local Python browser app prototype
+- Local Flask browser app prototype
 - Jobs page with processing status columns
 - Job Review page
-- Fake background processing stages
+- Background processing stages
 - Question cards before section drafting
 - Clarification files scoped to questions
 - Draft section output
 - Sections library
-- Simple package builder stub
-- Settings stub
+- Section editor with QA, media correction, merge/split tools
+- Package builder and package preview/print preview
+- Settings page for OpenAI/local transcription configuration
 
 Current app URL:
 
@@ -31,11 +32,11 @@ Current app URL:
 
 Limitations:
 
-- Data is in memory
-- Uploaded files are tracked by name only
-- Processing is simulated
-- Sections are not fully editable yet
-- Package builder is only a workflow stub
+- Storage is local-first and prototype-grade
+- Processing is still tuned for testing, not production scale
+- Review/approval permissions are not built yet
+- Operator console is not built yet
+- Automated PDF generation is not built yet; browser print is used for now
 
 ## Core Objects
 
