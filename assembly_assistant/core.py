@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from pathlib import Path
 from urllib import error as urllib_error
@@ -88,6 +89,44 @@ FRAME_ANALYSIS_BATCH_SIZE = 8
 FRAME_ANALYSIS_MAX_FRAMES = 420
 VIDEO_CANDIDATE_FRAME_LIMIT = 640
 SUPPLEMENTAL_FRAME_ANALYSIS_LIMIT = 80
+FRAME_ANALYSIS_PROFILE_BUDGETS = {
+    "fast": {
+        "frames_per_step": 4,
+        "min_frames": 48,
+        "max_frames": 180,
+        "coverage_reserve": 8,
+        "supplemental_per_weak_step": 2,
+        "supplemental_max_frames": 32,
+        "parallel_batches": 2,
+        "candidate_multiplier": 2.0,
+        "candidate_max": 260,
+    },
+    "standard": {
+        "frames_per_step": 6,
+        "min_frames": 72,
+        "max_frames": 260,
+        "coverage_reserve": 12,
+        "supplemental_per_weak_step": 4,
+        "supplemental_max_frames": 56,
+        "parallel_batches": 2,
+        "candidate_multiplier": 2.4,
+        "candidate_max": 420,
+    },
+    "deep": {
+        "frames_per_step": 10,
+        "min_frames": 120,
+        "max_frames": FRAME_ANALYSIS_MAX_FRAMES,
+        "coverage_reserve": 24,
+        "supplemental_per_weak_step": 8,
+        "supplemental_max_frames": SUPPLEMENTAL_FRAME_ANALYSIS_LIMIT,
+        "parallel_batches": 2,
+        "candidate_multiplier": 2.8,
+        "candidate_max": VIDEO_CANDIDATE_FRAME_LIMIT,
+    },
+}
+HARD_FRAME_CUE_TAGS = {"good_image", "operator_image_cue"}
+STEP_FRAME_CUE_TAGS = {"step", "step_window", "after_action_pause", "pause"}
+SOFT_FRAME_CUE_TAGS = {"parts", "tool", "torque", "threadlocker", "quality", "safety", "fixture"}
 VIDEO_COVERAGE_INTERVAL_SECONDS = 6
 VIDEO_CUE_BURST_SECONDS = 6
 PROCESSING_WATCHDOG_SECONDS = 10 * 60
@@ -1723,6 +1762,11 @@ def base_stages():
             "status": "idle",
             "percent": 0,
             "note": "",
+            "started_at": "",
+            "started_epoch": None,
+            "ended_at": "",
+            "ended_epoch": None,
+            "duration_seconds": None,
         }
         for key, label in STAGES
     }
@@ -1745,9 +1789,24 @@ def recompute_progress(job):
 
 def set_stage(job, key, status, percent=None, note=None):
     stage = job["stages"][key]
+    now = epoch_now()
+    previous_status = stage.get("status")
     stage["status"] = status
     stage["updated_at"] = datestamp()
-    stage["updated_epoch"] = epoch_now()
+    stage["updated_epoch"] = now
+    if status == "running" and (previous_status != "running" or not stage.get("started_epoch")):
+        stage["started_at"] = datestamp()
+        stage["started_epoch"] = now
+        stage["ended_at"] = ""
+        stage["ended_epoch"] = None
+        stage["duration_seconds"] = None
+    if status in {"done", "failed", "blocked"}:
+        stage.setdefault("started_at", stage.get("updated_at") or datestamp())
+        stage.setdefault("started_epoch", stage.get("updated_epoch") or now)
+        stage["ended_at"] = datestamp()
+        stage["ended_epoch"] = now
+        started = float(stage.get("started_epoch") or now)
+        stage["duration_seconds"] = round(max(0, now - started), 2)
     if percent is not None:
         stage["percent"] = percent
     if note is not None:
@@ -1755,6 +1814,28 @@ def set_stage(job, key, status, percent=None, note=None):
     recompute_progress(job)
     job["last_activity"] = timestamp()
     save_state()
+
+
+def start_job_processing_timing(job):
+    now = epoch_now()
+    job["processing_timing"] = {
+        "started_at": datestamp(),
+        "started_epoch": now,
+        "ended_at": "",
+        "ended_epoch": None,
+        "duration_seconds": None,
+        "profile": processing_profile_key(job),
+    }
+
+
+def finish_job_processing_timing(job):
+    timing = job.setdefault("processing_timing", {})
+    now = epoch_now()
+    started = float(timing.get("started_epoch") or now)
+    timing["ended_at"] = datestamp()
+    timing["ended_epoch"] = now
+    timing["duration_seconds"] = round(max(0, now - started), 2)
+    timing["profile"] = processing_profile_key(job)
 
 
 def unresolved_questions(job):
@@ -2407,6 +2488,19 @@ def adaptive_base_sample_rate(job):
     return ADAPTIVE_BASE_SAMPLE_RATES.get(profile, ADAPTIVE_BASE_SAMPLE_RATES["standard"])
 
 
+def processing_profile_key(job):
+    profile = str((job or {}).get("profile") or SETTINGS.get("default_processing") or "Standard").strip().lower()
+    return profile if profile in FRAME_ANALYSIS_PROFILE_BUDGETS else "standard"
+
+
+def frame_budget_config(job):
+    profile = processing_profile_key(job)
+    config = dict(FRAME_ANALYSIS_PROFILE_BUDGETS["standard"])
+    config.update(FRAME_ANALYSIS_PROFILE_BUDGETS.get(profile, {}))
+    config["profile"] = profile
+    return config
+
+
 def add_sampling_window(windows, start, end, rate, reason, tier, duration_seconds):
     try:
         start = float(start)
@@ -2851,7 +2945,7 @@ def apply_opencv_scoring(meta, cv_meta):
     focus_brightness = cv_meta.get("focus_brightness")
     delta = cv_meta.get("delta")
     focus_delta = cv_meta.get("focus_delta")
-    strong_cue = bool(tags & {"good_image", "step", "quality", "torque", "tool", "parts"})
+    strong_cue = bool(tags & (HARD_FRAME_CUE_TAGS | STEP_FRAME_CUE_TAGS))
 
     tags.add("opencv")
     if blur is not None:
@@ -2929,7 +3023,6 @@ def select_candidate_frames(job, frames, file=None):
     ]
     selected = {}
     selection_sources = {}
-    content_cue_tags = {"good_image", "step", "parts", "tool", "torque", "threadlocker", "quality", "safety", "fixture"}
     rejected_blurry = 0
     rejected_duplicate = 0
 
@@ -2940,7 +3033,10 @@ def select_candidate_frames(job, frames, file=None):
     for meta, frame in scored:
         timestamp_seconds = frame_timestamp_seconds(frame, timeline_offset_seconds)
         tags = set(meta.get("tags") or [])
-        strong_cue = bool(tags & {"good_image", "step", "quality", "tool", "parts"})
+        hard_cue = bool(tags & HARD_FRAME_CUE_TAGS)
+        step_cue = bool(tags & STEP_FRAME_CUE_TAGS)
+        soft_cue = bool(tags & SOFT_FRAME_CUE_TAGS)
+        strong_cue = hard_cue or step_cue
         endpoint_coverage = timestamp_seconds <= 2 or (duration_seconds and abs(duration_seconds - timestamp_seconds) <= 5)
         if endpoint_coverage:
             keep(frame, meta, "coverage")
@@ -2948,11 +3044,15 @@ def select_candidate_frames(job, frames, file=None):
         if "blurry" in tags and not strong_cue:
             rejected_blurry += 1
             continue
-        if "near_duplicate" in tags and not (strong_cue or "visual_change" in tags):
+        if "near_duplicate" in tags and not (hard_cue or "visual_change" in tags):
             rejected_duplicate += 1
             continue
-        if tags & content_cue_tags and meta["score"] >= 24:
-            keep(frame, meta, "cue")
+        if hard_cue and meta["score"] >= 20:
+            keep(frame, meta, "hard_cue")
+        elif step_cue and meta["score"] >= 34:
+            keep(frame, meta, "step_window")
+        elif soft_cue and ("sharp" in tags or "focus_sharp" in tags or meta["score"] >= 70):
+            keep(frame, meta, "soft_cue")
         elif "visual_change" in tags and meta["score"] >= 30:
             keep(frame, meta, "visual_change")
         elif meta["score"] >= 52:
@@ -2965,7 +3065,7 @@ def select_candidate_frames(job, frames, file=None):
     if len(selected) < duration_baseline:
         for meta, frame in ranked:
             tags = set(meta.get("tags") or [])
-            if "blurry" in tags and not (tags & {"good_image", "step", "quality"}):
+            if "blurry" in tags and not (tags & (HARD_FRAME_CUE_TAGS | STEP_FRAME_CUE_TAGS)):
                 continue
             if "near_duplicate" in tags and "visual_change" not in tags:
                 continue
@@ -2976,7 +3076,7 @@ def select_candidate_frames(job, frames, file=None):
     candidate_limit = dynamic_candidate_limit(job, len(frames), duration_seconds)
     hard_ceiling_applied = False
     if len(selected) > candidate_limit:
-        protected_sources = {"coverage", "cue"}
+        protected_sources = {"coverage", "hard_cue", "step_window"}
         protected_items = [
             item
             for item in selected.items()
@@ -3016,7 +3116,10 @@ def select_candidate_frames(job, frames, file=None):
         "opencv": cv_stats,
         "blurry_rejected": rejected_blurry,
         "duplicate_rejected": rejected_duplicate,
-        "cue_selected": source_counts.get("cue", 0),
+        "cue_selected": source_counts.get("hard_cue", 0) + source_counts.get("step_window", 0) + source_counts.get("soft_cue", 0),
+        "hard_cue_selected": source_counts.get("hard_cue", 0),
+        "step_window_selected": source_counts.get("step_window", 0),
+        "soft_cue_selected": source_counts.get("soft_cue", 0),
         "visual_change_selected": source_counts.get("visual_change", 0),
         "coverage_selected": source_counts.get("coverage", 0),
         "sharp_selected": source_counts.get("sharp", 0),
@@ -3047,17 +3150,231 @@ def dynamic_candidate_limit(job, raw_count, duration_seconds=0):
     step_count = rough_step_count_for_limit(job)
     if not step_count:
         step_count = max(8, int(max(duration_seconds or 0, raw_count or 0) // 30) + 1)
-    duration_bonus = int(max(0, float(duration_seconds or 0)) // 45) * 8
-    desired = max(220, step_count * 24 + 96 + duration_bonus)
-    return max(1, min(int(raw_count or desired), desired, VIDEO_CANDIDATE_FRAME_LIMIT))
+    config = frame_budget_config(job)
+    duration_bonus = min(48, int(max(0, float(duration_seconds or 0)) // 120) * 4)
+    desired = max(
+        config["min_frames"],
+        int(step_count * config["frames_per_step"] * config["candidate_multiplier"]) + config["coverage_reserve"] + duration_bonus,
+    )
+    candidate_max = int(config.get("candidate_max") or VIDEO_CANDIDATE_FRAME_LIMIT)
+    return max(1, min(int(raw_count or desired), desired, candidate_max, VIDEO_CANDIDATE_FRAME_LIMIT))
 
 
 def dynamic_frame_analysis_limit(job, candidate_count):
     step_count = rough_step_count_for_limit(job)
     if not step_count:
         step_count = max(8, int(candidate_count // 24) + 1)
-    desired = max(220, step_count * 22 + 96)
-    return max(1, min(int(candidate_count or desired), desired, FRAME_ANALYSIS_MAX_FRAMES))
+    config = frame_budget_config(job)
+    desired = max(config["min_frames"], step_count * config["frames_per_step"] + config["coverage_reserve"])
+    return max(1, min(int(candidate_count or desired), desired, config["max_frames"], FRAME_ANALYSIS_MAX_FRAMES))
+
+
+def frame_budget_score(frame):
+    score = float(frame.get("local_priority") or 0) + float(frame.get("instruction_value") or 0) * 0.35
+    tags = set(frame.get("candidate_tags") or [])
+    if tags & HARD_FRAME_CUE_TAGS:
+        score += 60
+    if tags & STEP_FRAME_CUE_TAGS:
+        score += 22
+    if "visual_change" in tags:
+        score += 18
+    if "focus_change" in tags:
+        score += 16
+    if "sharp" in tags or "focus_sharp" in tags:
+        score += 10
+    if "near_duplicate" in tags:
+        score -= 22
+    if "blurry" in tags or "focus_blurry" in tags:
+        score -= 30
+    return score
+
+
+def step_windows_for_frame_budget(job, duration_seconds):
+    rough_steps = transcript_step_slices(job) or job.get("transcript_step_slices") or []
+    windows = []
+    for index, step in enumerate(rough_steps):
+        start = timed_seconds(step.get("start_time"))
+        end = timed_seconds(step.get("end_time"))
+        if start is None or end is None:
+            continue
+        end = max(start + STEP_EXACT_MIN_WINDOW_SECONDS, end)
+        windows.append(
+            {
+                "index": index,
+                "start": max(0.0, start - 0.75),
+                "end": min(float(duration_seconds), end + 1.25) if duration_seconds else end + 1.25,
+                "target": min(float(duration_seconds), max(start, end - 0.5)) if duration_seconds else max(start, end - 0.5),
+                "source": step.get("id") or f"rough-{index + 1:03d}",
+            }
+        )
+    if windows:
+        return windows
+
+    step_count = rough_step_count_for_limit(job) or 0
+    if not step_count or not duration_seconds:
+        return []
+    span = max(float(duration_seconds or 0) / step_count, STEP_EXACT_MIN_WINDOW_SECONDS)
+    for index in range(step_count):
+        start = index * span
+        end = duration_seconds if index == step_count - 1 else (index + 1) * span
+        windows.append(
+            {
+                "index": index,
+                "start": max(0.0, start - 0.5),
+                "end": min(float(duration_seconds), end + 0.75),
+                "target": min(float(duration_seconds), max(start, end - 0.5)),
+                "source": f"estimated-{index + 1:03d}",
+            }
+        )
+    return windows
+
+
+def evenly_spaced_candidates(candidates, count, duration_seconds, excluded_paths=None):
+    if count <= 0 or not candidates:
+        return []
+    excluded_paths = excluded_paths or set()
+    ordered = sorted(candidates, key=lambda frame: float(frame.get("timestamp_seconds") or 0))
+    duration = float(duration_seconds or ordered[-1].get("timestamp_seconds") or 0)
+    if duration <= 0:
+        return []
+    selected = []
+    for index in range(count):
+        target = (index + 0.5) * duration / count
+        nearby = [
+            frame
+            for frame in ordered
+            if frame.get("stored_path") not in excluded_paths
+            and frame.get("stored_path") not in {item.get("stored_path") for item in selected}
+        ]
+        if not nearby:
+            break
+        best = min(
+            nearby,
+            key=lambda frame: (
+                abs(float(frame.get("timestamp_seconds") or 0) - target),
+                -frame_budget_score(frame),
+            ),
+        )
+        selected.append(best)
+    return selected
+
+
+def prioritize_frame_analysis_candidates(job, candidates):
+    if not candidates:
+        return [], {"profile": processing_profile_key(job), "analysis_limit": 0}
+
+    config = frame_budget_config(job)
+    analysis_limit = dynamic_frame_analysis_limit(job, len(candidates))
+    duration_seconds = max(float(frame.get("timestamp_seconds") or 0) for frame in candidates)
+    windows = step_windows_for_frame_budget(job, duration_seconds)
+    frames_per_step = int(config["frames_per_step"])
+    selected = {}
+    selection_sources = {}
+
+    def keep(frame, source):
+        stored = frame.get("stored_path")
+        if not stored:
+            return
+        selected[stored] = frame
+        selection_sources.setdefault(stored, set()).add(source)
+
+    hard_cue_frames = [
+        frame
+        for frame in candidates
+        if set(frame.get("candidate_tags") or []) & HARD_FRAME_CUE_TAGS
+    ]
+    for frame in sorted(hard_cue_frames, key=frame_budget_score, reverse=True):
+        keep(frame, "hard_cue")
+        if len(selected) >= analysis_limit:
+            break
+
+    step_budgeted_count = 0
+    for window in windows:
+        if len(selected) >= analysis_limit:
+            break
+        start = float(window["start"])
+        end = float(window["end"])
+        target = float(window["target"])
+        in_window = [
+            frame
+            for frame in candidates
+            if start <= float(frame.get("timestamp_seconds") or 0) <= end
+        ]
+        if not in_window:
+            in_window = [
+                frame
+                for frame in candidates
+                if abs(float(frame.get("timestamp_seconds") or 0) - target) <= STEP_FALLBACK_NEAR_SECONDS
+            ]
+        ranked = sorted(
+            in_window,
+            key=lambda frame: (
+                frame_budget_score(frame),
+                -abs(float(frame.get("timestamp_seconds") or 0) - target),
+            ),
+            reverse=True,
+        )
+        picked_for_step = 0
+        for frame in ranked:
+            stored = frame.get("stored_path")
+            if not stored or stored in selected:
+                continue
+            tags = set(frame.get("candidate_tags") or [])
+            if "blurry" in tags and not (tags & HARD_FRAME_CUE_TAGS):
+                continue
+            keep(frame, "step_budget")
+            step_budgeted_count += 1
+            picked_for_step += 1
+            if picked_for_step >= frames_per_step or len(selected) >= analysis_limit:
+                break
+
+    coverage_frames = evenly_spaced_candidates(
+        candidates,
+        int(config["coverage_reserve"]),
+        duration_seconds,
+        excluded_paths=set(selected),
+    )
+    for frame in coverage_frames:
+        if len(selected) >= analysis_limit:
+            break
+        keep(frame, "coverage_reserve")
+
+    fill_count = 0
+    for frame in sorted(candidates, key=frame_budget_score, reverse=True):
+        if len(selected) >= analysis_limit:
+            break
+        stored = frame.get("stored_path")
+        if not stored or stored in selected:
+            continue
+        tags = set(frame.get("candidate_tags") or [])
+        if "blurry" in tags and not (tags & HARD_FRAME_CUE_TAGS):
+            continue
+        if "near_duplicate" in tags and "visual_change" not in tags and not (tags & HARD_FRAME_CUE_TAGS):
+            continue
+        keep(frame, "priority_fill")
+        fill_count += 1
+
+    if not selected:
+        for frame in sorted(candidates, key=frame_budget_score, reverse=True)[:analysis_limit]:
+            keep(frame, "best_available_fallback")
+
+    ordered = sorted(selected.values(), key=lambda frame: float(frame.get("timestamp_seconds") or 0))
+    stats = {
+        "profile": config["profile"],
+        "analysis_limit": analysis_limit,
+        "candidate_frames": len(candidates),
+        "selected_frames": len(ordered),
+        "rough_step_windows": len(windows),
+        "frames_per_step": frames_per_step,
+        "hard_cue_frames": len([path for path, sources in selection_sources.items() if "hard_cue" in sources]),
+        "step_budgeted_frames": step_budgeted_count,
+        "coverage_reserve_frames": len([path for path, sources in selection_sources.items() if "coverage_reserve" in sources]),
+        "priority_fill_frames": fill_count,
+        "best_available_fallback_frames": len([path for path, sources in selection_sources.items() if "best_available_fallback" in sources]),
+        "ceiling_applied": len(candidates) > len(ordered),
+    }
+    return ordered, stats
+
 
 
 def clear_frame_artifacts_for_file(job, file):
@@ -3692,6 +4009,12 @@ def migrate_job_defaults(job):
     for stage in job.get("stages", {}).values():
         stage.setdefault("updated_at", datestamp())
         stage.setdefault("updated_epoch", job.get("last_activity_epoch") or epoch_now())
+        stage.setdefault("started_at", "")
+        stage.setdefault("started_epoch", None)
+        stage.setdefault("ended_at", "")
+        stage.setdefault("ended_epoch", None)
+        stage.setdefault("duration_seconds", None)
+    job.setdefault("processing_timing", {})
     for artifact in job.get("artifacts", []):
         if artifact.get("kind") == "frame" and "timestamp_seconds" not in artifact:
             match = re.search(r"~?(\d+(?:\.\d+)?)s", str(artifact.get("timestamp") or ""))
@@ -4834,6 +5157,9 @@ def supplemental_step_frame_candidates(job, sections):
     raw_sources = raw_video_frame_sources(job)
     if not raw_sources:
         return []
+    config = frame_budget_config(job)
+    per_step_limit = max(1, int(config.get("supplemental_per_weak_step") or 4))
+    supplemental_max = max(1, int(config.get("supplemental_max_frames") or SUPPLEMENTAL_FRAME_ANALYSIS_LIMIT))
     existing_analysis_paths = {
         item.get("stored_path")
         for item in job.get("frame_analysis", [])
@@ -4928,7 +5254,7 @@ def supplemental_step_frame_candidates(job, sections):
                 meta["tags"] = sorted(tags)
                 meta["reason"] = f"supplemental step media {delta:.1f}s from target; {meta.get('reason') or 'near unmatched step'}"
                 ranked.append((meta["score"], source, meta))
-            for _, source, meta in sorted(ranked, key=lambda item: item[0], reverse=True)[:4]:
+            for _, source, meta in sorted(ranked, key=lambda item: item[0], reverse=True)[:per_step_limit]:
                 rough.append(
                     {
                         "step_index": chronological_index,
@@ -4946,7 +5272,7 @@ def supplemental_step_frame_candidates(job, sections):
             continue
         selected.append(item)
         seen_paths.add(seen_key)
-        if len(selected) >= SUPPLEMENTAL_FRAME_ANALYSIS_LIMIT:
+        if len(selected) >= supplemental_max:
             break
     return selected
 
@@ -4975,42 +5301,61 @@ def analyze_supplemental_step_frames(job_id, sections):
                 paths.append(artifact["stored_path"])
             frames.append(artifact)
         weak_steps = len({item["step_index"] for item in candidates})
+        job_snapshot = json.loads(json.dumps(job))
+        config = frame_budget_config(job)
         add_log(job, f"Supplemental media pass: scoring {len(frames)} nearby frames for {weak_steps} steps without images.")
 
     failed = False
     saved_count = 0
-    for start in range(0, len(frames), FRAME_ANALYSIS_BATCH_SIZE):
-        batch = frames[start:start + FRAME_ANALYSIS_BATCH_SIZE]
-        results, error = analyze_frame_batch(JOBS[job_id], batch)
-        if error:
-            failed = True
+    batches = [
+        frames[start:start + FRAME_ANALYSIS_BATCH_SIZE]
+        for start in range(0, len(frames), FRAME_ANALYSIS_BATCH_SIZE)
+    ]
+
+    def analyze_timed_supplemental(batch):
+        started = epoch_now()
+        results, error = analyze_frame_batch(job_snapshot, batch)
+        return results, error, round(epoch_now() - started, 2)
+
+    max_workers = max(1, min(int(config.get("parallel_batches") or 1), len(batches)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {executor.submit(analyze_timed_supplemental, batch): batch for batch in batches}
+        for future in as_completed(future_map):
+            batch = future_map[future]
+            try:
+                results, error, batch_seconds = future.result()
+            except Exception as exc:
+                results, error, batch_seconds = [], f"supplemental_batch_exception: {exc}", 0
+            if error:
+                failed = True
+                with STATE_LOCK:
+                    add_log(JOBS[job_id], f"Supplemental frame analysis provider failed; using fallback scoring: {error}")
+                results = fallback_frame_analysis(batch)
             with STATE_LOCK:
-                add_log(JOBS[job_id], f"Supplemental frame analysis provider failed; using fallback scoring: {error}")
-            results = fallback_frame_analysis(batch)
-        with STATE_LOCK:
-            job = JOBS[job_id]
-            current_by_path = {
-                item.get("stored_path"): item
-                for item in job.get("frame_analysis", [])
-                if item.get("stored_path")
-            }
-            for result in results:
-                current_by_path[result["stored_path"]] = result
-            job["frame_analysis"] = sorted(
-                current_by_path.values(),
-                key=lambda item: float(item.get("timestamp_seconds") or 0),
-            )
-            batch_by_path = {result["stored_path"]: result for result in results}
-            for artifact in frame_artifacts(job):
-                analysis = batch_by_path.get(artifact.get("stored_path"))
-                if not analysis:
-                    continue
-                artifact["analysis"] = analysis
-                artifact["processing_status"] = "scored keyframe"
-                artifact["instruction_value"] = analysis.get("instruction_value", 0)
-                artifact["pointing"] = analysis.get("pointing", False)
-                artifact["discard"] = analysis.get("discard", False)
-            saved_count += len(results)
+                job = JOBS[job_id]
+                current_by_path = {
+                    item.get("stored_path"): item
+                    for item in job.get("frame_analysis", [])
+                    if item.get("stored_path")
+                }
+                for result in results:
+                    current_by_path[result["stored_path"]] = result
+                job["frame_analysis"] = sorted(
+                    current_by_path.values(),
+                    key=lambda item: float(item.get("timestamp_seconds") or 0),
+                )
+                batch_by_path = {result["stored_path"]: result for result in results}
+                for artifact in frame_artifacts(job):
+                    analysis = batch_by_path.get(artifact.get("stored_path"))
+                    if not analysis:
+                        continue
+                    artifact["analysis"] = analysis
+                    artifact["processing_status"] = "scored keyframe"
+                    artifact["instruction_value"] = analysis.get("instruction_value", 0)
+                    artifact["pointing"] = analysis.get("pointing", False)
+                    artifact["discard"] = analysis.get("discard", False)
+                saved_count += len(results)
+                add_log(job, f"Supplemental frame batch saved: {len(results)} frames in {batch_seconds}s.")
 
     with STATE_LOCK:
         job = JOBS[job_id]
@@ -5219,7 +5564,7 @@ def run_video_stage(job_id):
                     adaptive_note += f" · {extraction_stats.get('window_error_count')} window errors"
             add_log(
                 job,
-                f"Video frames extracted for {file.get('name')}: {selection_stats.get('raw_frames', len(frames))} raw · {len(frame_records)} candidates · {selection_stats.get('cue_selected', 0)} cue · {selection_stats.get('visual_change_selected', 0)} visual change · focus {selection_stats.get('focus_area', 'center')} · {selection_stats.get('blurry_rejected', 0)} blurry rejected · {selection_stats.get('duplicate_rejected', 0)} duplicate rejected · {ceiling_note} · {opencv_note}{adaptive_note}.",
+                f"Video frames extracted for {file.get('name')}: {selection_stats.get('raw_frames', len(frames))} raw · {len(frame_records)} candidates · {selection_stats.get('hard_cue_selected', 0)} hard cues · {selection_stats.get('step_window_selected', 0)} step windows · {selection_stats.get('soft_cue_selected', 0)} soft cues · {selection_stats.get('visual_change_selected', 0)} visual change · focus {selection_stats.get('focus_area', 'center')} · {selection_stats.get('blurry_rejected', 0)} blurry rejected · {selection_stats.get('duplicate_rejected', 0)} duplicate rejected · {ceiling_note} · {opencv_note}{adaptive_note}.",
             )
 
     if extracted_total:
@@ -5348,14 +5693,27 @@ def run_frame_analysis_stage(job_id):
             ),
             reverse=True,
         )
-        analysis_limit = dynamic_frame_analysis_limit(job, len(candidates))
-        ceiling_applied = len(candidates) > analysis_limit
-        prioritized = candidates[:analysis_limit]
-        if ceiling_applied:
+        frames, budget_stats = prioritize_frame_analysis_candidates(job, candidates)
+        if budget_stats.get("ceiling_applied"):
             step_count = rough_step_count_for_limit(job)
             reason = f"expected/parsed {step_count} steps" if step_count else "candidate volume"
-            add_log(job, f"Frame analysis dynamic guardrail applied: {len(candidates)} candidates available, scoring top {analysis_limit} based on {reason}.")
-        frames = sorted(prioritized, key=lambda frame: frame.get("timestamp_seconds", 0))
+            add_log(
+                job,
+                (
+                    f"Frame analysis budget applied: {len(candidates)} candidates available, scoring "
+                    f"{len(frames)} targeted frames using {budget_stats.get('profile')} profile based on {reason}."
+                ),
+            )
+            add_log(
+                job,
+                (
+                    f"Frame budget detail: {budget_stats.get('rough_step_windows', 0)} timed windows · "
+                    f"{budget_stats.get('frames_per_step', 0)} frames/step · "
+                    f"{budget_stats.get('step_budgeted_frames', 0)} step picks · "
+                    f"{budget_stats.get('hard_cue_frames', 0)} hard cues · "
+                    f"{budget_stats.get('coverage_reserve_frames', 0)} coverage reserve."
+                ),
+            )
         for index, frame in enumerate(frames, start=1):
             frame["frame_label"] = f"F{index:03d}"
         existing_by_path = {
@@ -5363,6 +5721,8 @@ def run_frame_analysis_stage(job_id):
             for item in job.get("frame_analysis", [])
             if item.get("stored_path")
         }
+        job_snapshot = json.loads(json.dumps(job))
+        config = frame_budget_config(job)
 
     if not frames:
         return
@@ -5374,57 +5734,107 @@ def run_frame_analysis_stage(job_id):
     ]
     reused_analysis_count = len(all_results)
     failed = False
+    batch_durations = []
+    batches = []
     for start in range(0, len(frames), FRAME_ANALYSIS_BATCH_SIZE):
         batch = frames[start:start + FRAME_ANALYSIS_BATCH_SIZE]
-        if all(frame.get("stored_path") in existing_by_path for frame in batch):
-            continue
+        if not all(frame.get("stored_path") in existing_by_path for frame in batch):
+            batches.append((start, batch))
+
+    if batches:
         with STATE_LOCK:
             job = JOBS[job_id]
-            percent = 78 + round((start / max(1, len(frames))) * 17)
-            set_stage(job, "video", "running", percent, f"Scoring frames {start + 1}-{start + len(batch)}")
-            add_log(job, f"Analyzing video frames {start + 1}-{start + len(batch)} for clarity, part placement, and pointing.")
-        results, error = analyze_frame_batch(job, batch)
-        if error:
-            failed = True
-            with STATE_LOCK:
-                add_log(JOBS[job_id], f"Frame analysis provider failed; using fallback scoring: {error}")
-            results = fallback_frame_analysis(batch)
-        with STATE_LOCK:
-            job = JOBS[job_id]
-            current_by_path = {
-                item.get("stored_path"): item
-                for item in job.get("frame_analysis", [])
-                if item.get("stored_path")
-            }
-            for result in results:
-                current_by_path[result["stored_path"]] = result
-                existing_by_path[result["stored_path"]] = result
-            ordered_results = [
-                current_by_path.get(frame.get("stored_path"))
-                for frame in frames
-                if current_by_path.get(frame.get("stored_path"))
-            ]
-            job["frame_analysis"] = ordered_results
-            batch_by_path = {result["stored_path"]: result for result in results}
-            for artifact in frame_artifacts(job):
-                analysis = batch_by_path.get(artifact.get("stored_path"))
-                if not analysis:
-                    continue
-                artifact["analysis"] = analysis
-                artifact["processing_status"] = "scored keyframe"
-                artifact["instruction_value"] = analysis.get("instruction_value", 0)
-                artifact["pointing"] = analysis.get("pointing", False)
-                artifact["discard"] = analysis.get("discard", False)
-            pointing_count = sum(1 for item in ordered_results if item.get("pointing"))
-            useful_count = sum(1 for item in ordered_results if item.get("instruction_value", 0) >= 65 and not item.get("discard"))
-            set_stage(
+            set_stage(job, "video", "running", 78, f"Scoring {len(frames)} targeted frames")
+            add_log(
                 job,
-                "video",
-                "running",
-                min(96, 80 + round(len(ordered_results) / max(1, len(frames)) * 16)),
-                f"{len(ordered_results)}/{len(frames)} frames scored · {pointing_count} pointing",
+                (
+                    f"Frame analysis queued: {len(batches)} batches · {len(frames)} target frames · "
+                    f"{reused_analysis_count} reused · {config.get('parallel_batches', 1)} parallel workers."
+                ),
             )
-            add_log(job, f"Frame analysis saved: {len(ordered_results)}/{len(frames)} scored · {useful_count} useful · {pointing_count} pointing.")
+    else:
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            trimmed_results = [
+                existing_by_path.get(frame.get("stored_path"))
+                for frame in frames
+                if existing_by_path.get(frame.get("stored_path"))
+            ]
+            job["frame_analysis"] = trimmed_results
+            add_log(job, f"Frame analysis reused cached scoring for {len(trimmed_results)} targeted frames.")
+
+    def analyze_timed_batch(batch):
+        started = epoch_now()
+        results, error = analyze_frame_batch(job_snapshot, batch)
+        return results, error, round(epoch_now() - started, 2)
+
+    if batches:
+        max_workers = max(1, min(int(config.get("parallel_batches") or 1), len(batches)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(analyze_timed_batch, batch): (start, batch)
+                for start, batch in batches
+            }
+            for future in as_completed(future_map):
+                start, batch = future_map[future]
+                try:
+                    results, error, batch_seconds = future.result()
+                except Exception as exc:
+                    results, error, batch_seconds = [], f"frame_batch_exception: {exc}", 0
+                batch_durations.append(
+                    {
+                        "start_frame": start + 1,
+                        "end_frame": start + len(batch),
+                        "seconds": batch_seconds,
+                    }
+                )
+                if error:
+                    failed = True
+                    with STATE_LOCK:
+                        add_log(JOBS[job_id], f"Frame analysis provider failed; using fallback scoring: {error}")
+                    results = fallback_frame_analysis(batch)
+                with STATE_LOCK:
+                    job = JOBS[job_id]
+                    current_by_path = {
+                        item.get("stored_path"): item
+                        for item in job.get("frame_analysis", [])
+                        if item.get("stored_path")
+                    }
+                    for result in results:
+                        current_by_path[result["stored_path"]] = result
+                        existing_by_path[result["stored_path"]] = result
+                    ordered_results = [
+                        current_by_path.get(frame.get("stored_path"))
+                        for frame in frames
+                        if current_by_path.get(frame.get("stored_path"))
+                    ]
+                    job["frame_analysis"] = ordered_results
+                    batch_by_path = {result["stored_path"]: result for result in results}
+                    for artifact in frame_artifacts(job):
+                        analysis = batch_by_path.get(artifact.get("stored_path"))
+                        if not analysis:
+                            continue
+                        artifact["analysis"] = analysis
+                        artifact["processing_status"] = "scored keyframe"
+                        artifact["instruction_value"] = analysis.get("instruction_value", 0)
+                        artifact["pointing"] = analysis.get("pointing", False)
+                        artifact["discard"] = analysis.get("discard", False)
+                    pointing_count = sum(1 for item in ordered_results if item.get("pointing"))
+                    useful_count = sum(1 for item in ordered_results if item.get("instruction_value", 0) >= 65 and not item.get("discard"))
+                    set_stage(
+                        job,
+                        "video",
+                        "running",
+                        min(96, 80 + round(len(ordered_results) / max(1, len(frames)) * 16)),
+                        f"{len(ordered_results)}/{len(frames)} frames scored · {pointing_count} pointing",
+                    )
+                    add_log(
+                        job,
+                        (
+                            f"Frame analysis saved: frames {start + 1}-{start + len(batch)} in {batch_seconds}s · "
+                            f"{len(ordered_results)}/{len(frames)} scored · {useful_count} useful · {pointing_count} pointing."
+                        ),
+                    )
 
     with STATE_LOCK:
         job = JOBS[job_id]
@@ -5441,6 +5851,10 @@ def run_frame_analysis_stage(job_id):
             "analysis_reused": reused_analysis_count,
             "analysis_scored": len(all_results),
             "candidate_frames": len(frames),
+            "available_candidate_frames": len(candidates),
+            "budget": budget_stats,
+            "parallel_batches": int(config.get("parallel_batches") or 1),
+            "batch_durations": batch_durations,
             "updated_at": datestamp(),
         }
         add_log(job, f"Frame analysis complete: {note}.")
@@ -5519,6 +5933,10 @@ def mark_job_thread_failed(job_id, exc):
             if stage.get("status") == "running":
                 stage["status"] = "failed"
                 stage["note"] = f"Failed: {message}"
+                stage["ended_at"] = datestamp()
+                stage["ended_epoch"] = epoch_now()
+                started = float(stage.get("started_epoch") or stage.get("updated_epoch") or epoch_now())
+                stage["duration_seconds"] = round(max(0, epoch_now() - started), 2)
                 had_running_stage = True
         if not had_running_stage:
             for stage in job.get("stages", {}).values():
@@ -5530,6 +5948,7 @@ def mark_job_thread_failed(job_id, exc):
         flags = job.setdefault("flags", [])
         if "Processing error" not in flags:
             flags.append("Processing error")
+        finish_job_processing_timing(job)
         recompute_progress(job)
         add_log(job, f"Processing error: {message}")
 
@@ -5560,6 +5979,7 @@ def start_processing(job_id, reset=True, first_run_only=False):
             job["media_selection"] = {}
             job["processing_started"] = True
             job["needs_processing"] = False
+            start_job_processing_timing(job)
             add_log(job, "Processing queued.")
         thread = threading.Thread(target=run_job_worker, args=(job_id, process_job), daemon=True)
         RUNNING_THREADS[job_id] = thread
@@ -5624,6 +6044,11 @@ def reset_stages_from(job, start_key):
         stage["note"] = ""
         stage["updated_at"] = datestamp()
         stage["updated_epoch"] = epoch_now()
+        stage["started_at"] = ""
+        stage["started_epoch"] = None
+        stage["ended_at"] = ""
+        stage["ended_epoch"] = None
+        stage["duration_seconds"] = None
     recompute_progress(job)
 
 
@@ -5820,6 +6245,7 @@ def run_media_assignment_stage(job_id):
             note += f" · {validation.get('issue_count')} QA items"
         set_stage(job, "draft_sections", "done", 100, note)
         job["status"] = "Draft Sections Ready"
+        finish_job_processing_timing(job)
         add_log(
             job,
             f"Media reassignment complete: {media_stats.get('steps', 0)} steps matched · {media_stats.get('fallback_image_steps', 0)} fallback · {media_stats.get('zero_image_steps', 0)} no-image · {validation.get('issue_count', 0)} QA items.",
@@ -5869,6 +6295,7 @@ def finish_drafting(job_id):
             draft_note += f" · {validation.get('issue_count')} QA items"
         set_stage(job, "draft_sections", "done", 100, draft_note)
         job["status"] = "Draft Sections Ready"
+        finish_job_processing_timing(job)
         if timing_stats.get("steps"):
             add_log(
                 job,
@@ -6362,6 +6789,7 @@ def job_summary(job):
         "draft_validation": job.get("draft_validation") or {},
         "draft_audit": job.get("draft_audit") or {},
         "processing_cache": job.get("processing_cache") or {},
+        "processing_timing": job.get("processing_timing") or {},
         "processing_health": job_processing_health(job),
         "stages": job["stages"],
     }
@@ -6419,6 +6847,7 @@ def processing_export():
     for job in JOBS.values():
         item = json.loads(json.dumps(job))
         item["transcripts"] = transcript_results(job)
+        item["summary"] = job_summary(job)
         jobs.append(item)
     return {
         "export_type": "assembly_assistant_processing_log",
