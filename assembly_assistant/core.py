@@ -19,6 +19,13 @@ from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from assembly_assistant.contracts import (
+    CONTRACT_VERSION,
+    detect_conflicts,
+    evidence_item,
+    source_contract,
+    stable_contract_id,
+)
 from assembly_assistant.sync import estimate_waveform_alignment, waveform_backend_available
 
 try:
@@ -909,7 +916,7 @@ def update_job_source(job, identity, data):
             target["timeline_alignment"] = {
                 "method": "pending_auto_alignment",
                 "confidence": "pending",
-                "reason": "Run transcription to estimate alignment from matching timed words.",
+                "reason": "Run processing to estimate alignment from shared audio or matching timed words.",
             }
 
     normalize_job_sources(job)
@@ -2147,6 +2154,7 @@ def run_transcription_stage(job_id):
             status = "failed"
         elif required_pending_provider:
             status = "blocked"
+        refresh_job_evidence(job)
         set_stage(job, "transcription", status, 100 if not required_extraction_failed else 75, note)
         add_log(job, f"Transcript stage complete: {note}.")
     return not required_extraction_failed and not required_transcription_failed and not required_pending_provider
@@ -2226,6 +2234,8 @@ def start_job_processing_timing(job):
     }
     normalize_job_sources(job)
     run = {
+        "contract": "ProcessingRun",
+        "contract_version": CONTRACT_VERSION,
         "manifest_version": PROCESSING_MANIFEST_VERSION,
         "run_id": short_id("run"),
         "status": "running",
@@ -2249,22 +2259,7 @@ def start_job_processing_timing(job):
             "instruction_model": SETTINGS.get("instruction_model") or "gpt-4o-mini",
             "transcription_enabled": bool(SETTINGS.get("transcription_enabled", True)),
         },
-        "sources": [
-            {
-                "source_id": file.get("source_id") or "",
-                "name": file.get("name") or "",
-                "kind": file.get("kind") or file_kind(file),
-                "sha256": file.get("sha256") or "",
-                "bytes": int(file.get("bytes") or 0),
-                "source_role": file.get("source_role") or "",
-                "authority_level": file.get("authority_level") or "",
-                "revision": file.get("revision") or "",
-                "applicability": file.get("applicability") or "",
-                "use_for_drafting": bool(file.get("use_for_drafting")),
-                "timeline_reference": bool(file.get("timeline_reference")),
-            }
-            for file in active_job_files(job)
-        ],
+        "sources": [source_contract(file) for file in active_job_files(job)],
         "stages": {},
         "metrics": {},
         "failures": [],
@@ -2322,8 +2317,15 @@ def refresh_processing_manifest(job, status=None, outcome=""):
         "steps": sum(len(section.get("steps") or []) for section in job.get("draft_sections") or []),
         "questions": len(job.get("questions") or []),
         "qa_issues": int((job.get("draft_validation") or {}).get("issue_count") or 0),
+        "evidence_items": len(job.get("evidence_items") or []),
+        "evidence_conflicts": len(job.get("evidence_conflicts") or []),
         "cache": json.loads(json.dumps(job.get("processing_cache") or {})),
     }
+    run["evidence_ids"] = [
+        item.get("evidence_id")
+        for item in job.get("evidence_items") or []
+        if item.get("evidence_id")
+    ]
     run["failures"] = [
         {
             "stage": key,
@@ -4299,11 +4301,96 @@ def group_actions(actions):
     return groups
 
 
+def evidence_conflict_questions(job):
+    questions = []
+    for conflict in job.get("evidence_conflicts") or []:
+        if conflict.get("status") != "open":
+            continue
+        choices = []
+        seen = set()
+        for claim in conflict.get("claims") or []:
+            label = f"Use {claim.get('source_name') or 'source'}: {claim.get('value')}"
+            if label not in seen:
+                seen.add(label)
+                choices.append(label[:140])
+        choices.append("Not applicable to this job")
+        claim_summary = "; ".join(
+            f"{claim.get('source_name') or 'source'} says {claim.get('value')}"
+            for claim in conflict.get("claims") or []
+        )
+        questions.append(
+            {
+                "id": short_id("q"),
+                "job_id": job["id"],
+                "title": "Resolve source conflict",
+                "prompt": (
+                    f"Conflicting {str(conflict.get('fact_type') or 'technical').replace('_', ' ')} values "
+                    f"were found for {conflict.get('subject') or 'the same subject'}: {claim_summary}. "
+                    "Select the applicable source/value, mark it not applicable, or leave it pending for engineering review."
+                ),
+                "source": "source evidence",
+                "why": conflict.get("reason") or "Different technical values were found.",
+                "choices": choices[:6],
+                "status": "pending",
+                "answer": "",
+                "attachment_note": "",
+                "attachment_files": [],
+                "conflict_id": conflict.get("conflict_id") or "",
+                "evidence_ids": conflict.get("evidence_ids") or [],
+            }
+        )
+    return questions
+
+
+def evidence_applicability_questions(job):
+    questions = []
+    evidence_by_source = {}
+    for item in job.get("evidence_items") or []:
+        if item.get("evidence_type") != "document_page":
+            continue
+        evidence_by_source.setdefault(item.get("source_id") or "", []).append(item)
+
+    for source_id, items in evidence_by_source.items():
+        if not source_id or not items:
+            continue
+        review = items[0].get("applicability_review") or {}
+        if review.get("status") not in {"unspecified", "review_required"}:
+            continue
+        source_name = items[0].get("source_name") or "supporting document"
+        reasons = review.get("reasons") or ["Source applicability needs confirmation."]
+        questions.append(
+            {
+                "id": short_id("q"),
+                "job_id": job["id"],
+                "title": "Confirm source applicability",
+                "prompt": (
+                    f"Confirm how {source_name} should be used for product "
+                    f"{job.get('product') or 'not specified'}. "
+                    f"{' '.join(reasons)}"
+                ),
+                "source": "supporting document",
+                "why": "Technical source content is excluded from drafting until its applicability is confirmed.",
+                "choices": [
+                    "Applies to this job",
+                    "Supporting context only",
+                    "Does not apply to this job",
+                ],
+                "status": "pending",
+                "answer": "",
+                "attachment_note": "",
+                "attachment_files": [],
+                "applicability_source_id": source_id,
+                "evidence_ids": [item.get("evidence_id") for item in items if item.get("evidence_id")],
+            }
+        )
+    return questions
+
+
 def transcript_questions_for(job):
     text = transcript_text(job)
+    questions = evidence_applicability_questions(job) + evidence_conflict_questions(job)
     if not text:
-        return []
-    questions = []
+        return questions
     lowered = text.lower()
     fastener_context = re.search(r"\b(install|insert|tighten|secure|fasten|attach|torque)\b[^.]{0,80}\b(bolt|screw|fastener|nut)\b|\b(bolt|screw|fastener|nut)\b[^.]{0,80}\b(install|insert|tighten|secure|fasten|attach|torque)\b", lowered)
     torque_value = re.search(r"\b\d+(?:\.\d+)?\s?(?:in-?lb|ft-?lb|n-?m|nm)\b", lowered)
@@ -4366,7 +4453,7 @@ def transcript_questions_for(job):
                 "attachment_files": [],
             }
         )
-    return questions[:3]
+    return questions
 
 
 def question_review_for(job, questions):
@@ -4380,6 +4467,32 @@ def question_review_for(job, questions):
         checks.append({"label": label, "result": result, "detail": detail})
         if result == "cleared":
             bypass_reasons.append(detail)
+
+    open_conflicts = [
+        conflict
+        for conflict in job.get("evidence_conflicts") or []
+        if conflict.get("status") == "open"
+    ]
+    if "Resolve source conflict" in question_titles:
+        add_check("Source conflicts", "question", f"{len(open_conflicts)} technical source conflict(s) require a user decision.")
+    elif open_conflicts:
+        add_check("Source conflicts", "question", f"{len(open_conflicts)} source conflict(s) remain open.")
+    else:
+        add_check("Source conflicts", "cleared", "No unresolved technical value conflicts were detected.")
+
+    applicability_questions = [
+        question
+        for question in questions
+        if question.get("title") == "Confirm source applicability" and question.get("status") == "pending"
+    ]
+    if applicability_questions:
+        add_check(
+            "Source applicability",
+            "question",
+            f"{len(applicability_questions)} supporting source(s) require an applicability decision.",
+        )
+    else:
+        add_check("Source applicability", "cleared", "No supporting source applicability decisions remain.")
 
     torque_present = bool(re.search(r"\b\d+(?:\.\d+)?\s?(?:in-?lb|ft-?lb|n-?m|nm)\b", lowered))
     fastener_context = bool(re.search(r"\b(install|insert|tighten|secure|fasten|attach|torque)\b[^.]{0,80}\b(bolt|screw|fastener|nut)\b|\b(bolt|screw|fastener|nut)\b[^.]{0,80}\b(install|insert|tighten|secure|fasten|attach|torque)\b", lowered))
@@ -4493,6 +4606,12 @@ def make_job(name, product, work_area, station, profile="Standard", files=None, 
         "questions": [],
         "question_review": {},
         "document_evidence": [],
+        "source_contracts": [],
+        "evidence_items": [],
+        "evidence_facts": [],
+        "evidence_conflicts": [],
+        "evidence_applicability_resolutions": {},
+        "evidence_summary": {},
         "transcript_step_slices": [],
         "step_parse": {},
         "draft_sections": [],
@@ -4523,6 +4642,12 @@ def migrate_job_defaults(job):
     job.setdefault("frame_analysis", [])
     job.setdefault("question_review", {})
     job.setdefault("document_evidence", [])
+    job.setdefault("source_contracts", [])
+    job.setdefault("evidence_items", [])
+    job.setdefault("evidence_facts", [])
+    job.setdefault("evidence_conflicts", [])
+    job.setdefault("evidence_applicability_resolutions", {})
+    job.setdefault("evidence_summary", {})
     job.setdefault("draft_validation", {})
     job.setdefault("draft_audit", {})
     job.setdefault("processing_cache", {})
@@ -4760,6 +4885,11 @@ def normalize_frame_analysis(frame, incoming):
 
 def normalize_ai_sections(job, data):
     frame_paths = {frame.get("stored_path") for frame in frame_artifacts(job)}
+    valid_evidence_ids = {
+        item.get("evidence_id")
+        for item in job.get("evidence_items") or []
+        if item.get("evidence_id")
+    }
     sections = []
     for section in (data or {}).get("sections", []):
         steps = []
@@ -4779,6 +4909,11 @@ def normalize_ai_sections(job, data):
                     "parts": step.get("parts") or [],
                     "media": media,
                     "source_step_id": step.get("source_step_id") or "",
+                    "evidence_ids": [
+                        evidence_id
+                        for evidence_id in step.get("evidence_ids") or []
+                        if evidence_id in valid_evidence_ids
+                    ],
                 }
             )
         steps = [step for step in steps if step["text"]]
@@ -4817,7 +4952,7 @@ def rough_step_prompt_payload(rough_steps):
     return payload
 
 
-def apply_rough_step_metadata(sections, rough_steps):
+def apply_rough_step_metadata(sections, rough_steps, job=None):
     rough_by_id = {step.get("id"): step for step in rough_steps if step.get("id")}
     flat_steps = [
         step
@@ -4844,6 +4979,10 @@ def apply_rough_step_metadata(sections, rough_steps):
         step["raw_transcript"] = rough.get("raw_text") or ""
         step["boundary_reason"] = rough.get("boundary_reason") or ""
         step["transcript_confidence"] = rough.get("confidence") or "medium"
+        if job:
+            step["evidence_ids"] = sorted(
+                set((step.get("evidence_ids") or []) + evidence_ids_for_rough_step(job, rough.get("id")))
+            )
     return sections
 
 
@@ -4875,7 +5014,8 @@ Return JSON only, with this exact shape:
           "quality": "observable quality check or empty",
           "safety": "specific safety callout or empty",
           "parts": ["parts or consumables named in transcript"],
-          "media": ["one or more provided frame paths"]
+          "media": ["one or more provided frame paths"],
+          "evidence_ids": ["evidence IDs that directly support this step"]
         }}
       ]
     }}
@@ -4886,6 +5026,8 @@ Rules:
 - Do not invent drawings, frame names, torque values, tools, parts, or safety risks.
 - Use supporting-document facts only when the quoted evidence applies to this product/configuration.
 - Prefer authoritative sources over supporting context. Surface contradictions instead of silently choosing one.
+- Cite only evidence IDs shown below. Every technical value taken from a document must include its evidence ID.
+- Open source conflicts are unresolved. Do not select a value unless the Question answers explicitly resolve it.
 - Do not invent technical values when a document is absent, unreadable, revision-unknown, or ambiguous.
 - Use only these frame paths in media: {json.dumps(frames[:160])}
 - Prefer clear, concrete, shop-floor wording.
@@ -4916,12 +5058,15 @@ Transcript excerpt:
 
 Supporting document evidence:
 {supporting_context or "None processed"}
+
+Open source conflicts:
+{evidence_conflict_context(job) or "None"}
 """
     data, error = call_openai_json(prompt)
     if error:
         return [], error
     sections = normalize_ai_sections(job, data)
-    sections = apply_rough_step_metadata(sections, rough_steps)
+    sections = apply_rough_step_metadata(sections, rough_steps, job)
     return sections, None if sections else "openai_returned_no_sections"
 
 
@@ -4955,9 +5100,10 @@ def heuristic_draft_sections_for(job):
                 "parts": step_parts(action),
                 "media": media,
                 "source_step_id": rough.get("id") or "",
+                "evidence_ids": evidence_ids_for_rough_step(job, rough.get("id")),
             }
             if rough:
-                apply_rough_step_metadata([{"steps": [step]}], [rough])
+                apply_rough_step_metadata([{"steps": [step]}], [rough], job)
             steps.append(step)
             step_counter += 1
             rough_counter += 1
@@ -5642,6 +5788,9 @@ def attach_best_media_to_drafts(job, sections):
             step["media_match_score"] = round(selected_score or top_score, 2)
             if chosen:
                 step["media"] = chosen
+                step["evidence_ids"] = sorted(
+                    set((step.get("evidence_ids") or []) + evidence_ids_for_media(job, chosen))
+                )
                 assigned += 1
                 if len(chosen) == 1:
                     single_image_steps += 1
@@ -5945,7 +6094,12 @@ def clear_document_artifacts(job, source_file):
 
 def document_evidence_record(file, page_number, text, stored_path="", extraction_method=""):
     return {
-        "evidence_id": short_id("evidence"),
+        "evidence_id": stable_contract_id(
+            "ev",
+            file.get("source_id") or file.get("sha256") or file.get("name"),
+            "document_page",
+            page_number,
+        ),
         "source_id": file.get("source_id") or "",
         "source_file": file.get("name") or "",
         "source_role": file.get("source_role") or "supporting_document",
@@ -6077,6 +6231,11 @@ def process_pdf_document(job, file, path):
 def document_context(job, max_chars=7000):
     blocks = []
     used = 0
+    neutral_evidence = {
+        item.get("evidence_id"): item
+        for item in job.get("evidence_items") or []
+        if item.get("evidence_id")
+    }
     authority_order = {"authoritative": 0, "primary_evidence": 1, "supporting_context": 2, "reference_only": 3}
     evidence_records = sorted(
         job.get("document_evidence", []),
@@ -6087,13 +6246,20 @@ def document_context(job, max_chars=7000):
         ),
     )
     for evidence in evidence_records:
+        neutral = neutral_evidence.get(evidence.get("evidence_id"))
+        review_status = ((neutral or {}).get("applicability_review") or {}).get("status")
+        if neutral and review_status in {"unspecified", "review_required", "not_applicable"}:
+            continue
         text = (evidence.get("text") or "").strip()
         if not text:
             continue
         heading = (
-            f"Source: {evidence.get('source_file') or 'document'}"
+            f"Evidence: {evidence.get('evidence_id') or 'unassigned'}"
+            f" | source: {evidence.get('source_file') or 'document'}"
             f" | authority: {evidence.get('authority_level') or 'supporting_context'}"
             f" | revision: {evidence.get('revision') or 'not provided'}"
+            f" | applicability: {evidence.get('applicability') or 'not provided'}"
+            f" | applicability review: {review_status or 'legacy source'}"
             f" | page: {evidence.get('page_number') or 1}"
         )
         remaining = max_chars - used - len(heading) - 2
@@ -6103,6 +6269,207 @@ def document_context(job, max_chars=7000):
         blocks.append(block)
         used += len(block) + 2
     return "\n\n".join(blocks)
+
+
+def source_contract_map(job):
+    contracts = [source_contract(file) for file in active_job_files(job)]
+    by_identity = {}
+    for contract in contracts:
+        if contract.get("source_id"):
+            by_identity[contract["source_id"]] = contract
+        if contract.get("name"):
+            by_identity[contract["name"]] = contract
+    return contracts, by_identity
+
+
+def refresh_job_evidence(job):
+    """Build additive neutral evidence records from current Assembly job data."""
+    normalize_job_sources(job)
+    contracts, sources = source_contract_map(job)
+    applicability_resolutions = job.get("evidence_applicability_resolutions") or {}
+    items = []
+    seen = set()
+
+    def add(item):
+        evidence_id = item.get("evidence_id")
+        if not evidence_id or evidence_id in seen:
+            return
+        resolution = applicability_resolutions.get(item.get("source_id"))
+        if resolution:
+            review = dict(item.get("applicability_review") or {})
+            review["status"] = resolution.get("status") or review.get("status") or "review_required"
+            review["resolution"] = dict(resolution)
+            item["applicability_review"] = review
+        seen.add(evidence_id)
+        items.append(item)
+
+    drafting_files = drafting_source_files(job)
+    drafting_source = sources.get((drafting_files[0].get("source_id") if drafting_files else "")) if drafting_files else None
+    rough_steps = transcript_step_slices(job)
+    job["transcript_step_slices"] = rough_steps
+    if drafting_source:
+        for step in rough_steps:
+            add(
+                evidence_item(
+                    evidence_type="transcript_span",
+                    source=drafting_source,
+                    locator={
+                        "rough_step_id": step.get("id") or "",
+                        "start_seconds": step.get("start_time"),
+                        "end_seconds": step.get("end_time"),
+                    },
+                    text=step.get("raw_text") or "",
+                    summary=step.get("boundary_reason") or "",
+                    tags=["instruction_narration", "step_boundary"],
+                    confidence=step.get("confidence") or "unknown",
+                    extraction_method=step.get("source") or "transcript_parser",
+                    product=job.get("product") or "",
+                )
+            )
+
+    for record in job.get("document_evidence") or []:
+        source = sources.get(record.get("source_id")) or sources.get(record.get("source_file"))
+        if not source:
+            continue
+        item = evidence_item(
+            evidence_type="document_page",
+            source=source,
+            locator={
+                "page_number": int(record.get("page_number") or 1),
+                "storage_ref": record.get("stored_path") or "",
+            },
+            text=record.get("text") or "",
+            summary=(record.get("text") or "")[:240],
+            tags=["supporting_document", record.get("extraction_method") or ""],
+            confidence="high" if record.get("extraction_method") == "embedded_text" else "medium",
+            extraction_method=record.get("extraction_method") or "render_only",
+            product=job.get("product") or "",
+        )
+        record["evidence_id"] = item["evidence_id"]
+        record["applicability_review"] = item["applicability_review"]
+        add(item)
+
+    frame_sources = {
+        file.get("name"): sources.get(file.get("source_id"))
+        for file in active_job_files(job)
+        if file.get("kind") == "video"
+    }
+    for frame in frame_analysis_records(job):
+        source = frame_sources.get(frame.get("source_file"))
+        if not source:
+            continue
+        tags = list(frame.get("tags") or [])
+        for flag in ["pointing", "after_state", "before_state", "tool_visible", "quality_check"]:
+            if frame.get(flag):
+                tags.append(flag)
+        add(
+            evidence_item(
+                evidence_type="video_frame",
+                source=source,
+                locator={
+                    "timestamp_seconds": frame.get("timestamp_seconds"),
+                    "source_timestamp_seconds": frame.get("source_timestamp_seconds"),
+                    "storage_ref": frame.get("stored_path") or "",
+                },
+                text=frame.get("visual_summary") or "",
+                summary=frame.get("reason") or frame.get("visual_summary") or "",
+                tags=tags,
+                confidence="high" if frame.get("instruction_value", 0) >= 75 else "medium" if frame.get("instruction_value", 0) >= 50 else "low",
+                extraction_method="frame_analysis",
+                product=job.get("product") or "",
+            )
+        )
+
+    for file in active_job_files(job):
+        if file.get("kind") != "image":
+            continue
+        source = sources.get(file.get("source_id"))
+        if not source:
+            continue
+        add(
+            evidence_item(
+                evidence_type="uploaded_image",
+                source=source,
+                locator={"storage_ref": file.get("stored_path") or ""},
+                summary=file.get("name") or "Uploaded reference image",
+                tags=["uploaded_image", "semantic_analysis_pending"],
+                confidence="unreviewed",
+                extraction_method="upload_inventory",
+                product=job.get("product") or "",
+            )
+        )
+
+    previous_conflicts = {
+        item.get("conflict_id"): item
+        for item in job.get("evidence_conflicts") or []
+        if item.get("conflict_id")
+    }
+    conflicts, facts = detect_conflicts(items)
+    for conflict in conflicts:
+        previous = previous_conflicts.get(conflict.get("conflict_id")) or {}
+        if previous.get("status") in {"resolved", "bypassed"}:
+            conflict["status"] = previous["status"]
+            conflict["resolution"] = previous.get("resolution") or {}
+
+    type_counts = {}
+    applicability_counts = {}
+    for item in items:
+        evidence_type = item.get("evidence_type") or "unknown"
+        type_counts[evidence_type] = type_counts.get(evidence_type, 0) + 1
+        applicability = (item.get("applicability_review") or {}).get("status") or "unspecified"
+        applicability_counts[applicability] = applicability_counts.get(applicability, 0) + 1
+    job["source_contracts"] = contracts
+    job["evidence_items"] = items
+    job["evidence_facts"] = facts
+    job["evidence_conflicts"] = conflicts
+    job["evidence_summary"] = {
+        "contract_version": CONTRACT_VERSION,
+        "source_count": len(contracts),
+        "evidence_count": len(items),
+        "fact_count": len(facts),
+        "open_conflicts": sum(1 for conflict in conflicts if conflict.get("status") == "open"),
+        "high_severity_conflicts": sum(1 for conflict in conflicts if conflict.get("status") == "open" and conflict.get("severity") == "high"),
+        "types": type_counts,
+        "applicability": applicability_counts,
+        "updated_at": datestamp(),
+    }
+    return job["evidence_summary"]
+
+
+def evidence_ids_for_rough_step(job, rough_step_id):
+    return [
+        item.get("evidence_id")
+        for item in job.get("evidence_items") or []
+        if item.get("evidence_type") == "transcript_span"
+        and (item.get("locator") or {}).get("rough_step_id") == rough_step_id
+        and item.get("evidence_id")
+    ]
+
+
+def evidence_ids_for_media(job, media_paths):
+    paths = set(media_paths or [])
+    return [
+        item.get("evidence_id")
+        for item in job.get("evidence_items") or []
+        if (item.get("locator") or {}).get("storage_ref") in paths and item.get("evidence_id")
+    ]
+
+
+def evidence_conflict_context(job, max_conflicts=12):
+    lines = []
+    for conflict in job.get("evidence_conflicts") or []:
+        if conflict.get("status") != "open":
+            continue
+        claims = "; ".join(
+            f"{claim.get('source_name')}: {claim.get('value')} ({claim.get('evidence_id')})"
+            for claim in conflict.get("claims") or []
+        )
+        lines.append(
+            f"{conflict.get('conflict_id')} | {conflict.get('fact_type')} | {conflict.get('subject')} | {claims}"
+        )
+        if len(lines) >= max_conflicts:
+            break
+    return "\n".join(lines)
 
 
 def run_document_stage(job_id):
@@ -6179,7 +6546,10 @@ def run_document_stage(job_id):
 
     with STATE_LOCK:
         job = JOBS[job_id]
+        evidence_summary = refresh_job_evidence(job)
         note = f"{processed} documents · {page_count} pages · {text_chars} text characters"
+        if evidence_summary.get("open_conflicts"):
+            note += f" · {evidence_summary.get('open_conflicts')} source conflicts"
         if failed:
             note += f" · {failed} failed"
             if "Document processing issue" not in job["flags"]:
@@ -6196,6 +6566,7 @@ def run_image_inventory_stage(job_id):
         images = [file for file in active_job_files(job) if file.get("kind") == "image" and stored_path(file)]
         for file in images:
             file["image_status"] = "available for manual evidence selection"
+        refresh_job_evidence(job)
         note = f"{len(images)} uploaded images cataloged"
         if images:
             note += " · semantic image analysis pending"
@@ -6404,6 +6775,7 @@ def run_video_stage(job_id):
 
     with STATE_LOCK:
         job = JOBS[job_id]
+        refresh_job_evidence(job)
         if failed and not extracted_total:
             set_stage(job, "video", "failed", 70, f"{failed} video files failed")
         else:
@@ -7231,6 +7603,7 @@ def clean_step(step):
         "safety": step.get("safety") or "",
         "parts": normalize_list(step.get("parts")),
         "media": normalize_list(step.get("media")),
+        "evidence_ids": normalize_list(step.get("evidence_ids")),
     }
     media_settings = normalize_media_settings(step.get("media_settings"), cleaned["media"])
     if media_settings:
@@ -7596,6 +7969,9 @@ def job_processing_health(job):
         warnings.append(f"{media_selection.get('zero_image_steps')} steps have no selected image")
     if media_selection.get("fallback_image_steps"):
         warnings.append(f"{media_selection.get('fallback_image_steps')} steps use fallback media")
+    evidence_summary = job.get("evidence_summary") or {}
+    if evidence_summary.get("open_conflicts"):
+        warnings.append(f"{evidence_summary.get('open_conflicts')} technical source conflicts require review")
     if job.get("watchdog", {}).get("stage"):
         warnings.append("Watchdog has recent processing state")
     return {
@@ -7608,6 +7984,9 @@ def job_processing_health(job):
         "timing_steps": step_timing.get("steps") or 0,
         "zero_image_steps": media_selection.get("zero_image_steps") or 0,
         "fallback_image_steps": media_selection.get("fallback_image_steps") or 0,
+        "evidence_items": evidence_summary.get("evidence_count") or 0,
+        "evidence_facts": evidence_summary.get("fact_count") or 0,
+        "evidence_conflicts": evidence_summary.get("open_conflicts") or 0,
         "warnings": warnings,
     }
 
@@ -8165,6 +8544,58 @@ def create_app():
             target_question["answer"] = data.get("answer") or ""
             target_question["attachment_note"] = data.get("attachment_note") or ""
             target_question["attachment_files"] = data.get("attachment_files") or []
+            conflict_id = target_question.get("conflict_id")
+            if conflict_id:
+                conflict = next(
+                    (
+                        item
+                        for item in target_job.get("evidence_conflicts") or []
+                        if item.get("conflict_id") == conflict_id
+                    ),
+                    None,
+                )
+                if conflict:
+                    conflict["status"] = "bypassed" if target_question["status"] == "bypassed" else "resolved"
+                    conflict["resolution"] = {
+                        "answer": target_question["answer"],
+                        "attachment_note": target_question["attachment_note"],
+                        "resolved_at": datestamp(),
+                        "question_id": qid,
+                    }
+            applicability_source_id = target_question.get("applicability_source_id")
+            if applicability_source_id:
+                answer = target_question["answer"].strip().lower()
+                if target_question["status"] == "bypassed":
+                    applicability_status = "review_required"
+                elif answer.startswith("does not apply") or answer.startswith("not applicable"):
+                    applicability_status = "not_applicable"
+                elif answer.startswith("supporting context"):
+                    applicability_status = "supporting_only"
+                elif answer.startswith("applies to this job"):
+                    applicability_status = "applicable"
+                else:
+                    applicability_status = "review_required"
+                target_job.setdefault("evidence_applicability_resolutions", {})[applicability_source_id] = {
+                    "status": applicability_status,
+                    "answer": target_question["answer"],
+                    "attachment_note": target_question["attachment_note"],
+                    "resolved_at": datestamp(),
+                    "question_id": qid,
+                }
+                refresh_job_evidence(target_job)
+                active_conflict_ids = {
+                    item.get("conflict_id")
+                    for item in target_job.get("evidence_conflicts") or []
+                    if item.get("status") == "open"
+                }
+                for question in target_job.get("questions") or []:
+                    if (
+                        question.get("status") == "pending"
+                        and question.get("conflict_id")
+                        and question.get("conflict_id") not in active_conflict_ids
+                    ):
+                        question["status"] = "bypassed"
+                        question["answer"] = "Source marked not applicable."
             metadata_only_files = [
                 file
                 for file in target_question["attachment_files"]
@@ -8187,6 +8618,7 @@ def create_app():
             elif target_question["attachment_files"]:
                 add_log(target_job, f"Linked {len(target_question['attachment_files'])} stored clarification files to question: {target_question['title']}.")
             pending = unresolved_questions(target_job)
+            target_job["question_review"] = question_review_for(target_job, target_job.get("questions") or [])
             set_question_flag(target_job, len(pending))
             if pending:
                 set_stage(

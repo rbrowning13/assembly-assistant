@@ -23,6 +23,8 @@ Read the [roadmap](ROADMAP.md) for delivery phases, [project status](docs/PROJEC
 - Assign source roles, choose one drafting narration, and align alternate camera timelines with shared-audio, transcript, or manual anchors.
 - Sample and score video frames with OpenCV and semantic analysis.
 - Render PDF pages, extract embedded text, OCR scanned pages when local tools are available, and retain page-level evidence.
+- Adapt current uploads, transcript spans, video frames, document pages, and still images into versioned neutral source/evidence contracts.
+- Require explicit applicability decisions for uncertain supporting documents and surface conflicting torque, dimension, part-number, and safety claims for review.
 - Generate clarification questions and assembly-oriented draft sections.
 - Review and edit steps, fields, media, and QA items.
 - Save completed sections into a searchable library.
@@ -32,7 +34,7 @@ Read the [roadmap](ROADMAP.md) for delivery phases, [project status](docs/PROJEC
 ## Important Prototype Limits
 
 - The current drafting and QA behavior is intentionally assembly-oriented.
-- PDF rendering/text/OCR is implemented, but drawing title-block, revision, BOM, table, callout, and conflict interpretation is not complete.
+- PDF rendering/text/OCR and initial technical-value conflict detection are implemented, but drawing title-block, revision, BOM, table, and callout interpretation is not complete.
 - Uploaded still images are available as authoring evidence but do not yet receive semantic analysis.
 - Multi-angle alignment supports shared-audio offsets, transcript matching, and manual drift anchors; automatic waveform drift and visual-marker alignment are not implemented yet.
 - Background processing currently runs inside the Flask process and is not durable across a restart.

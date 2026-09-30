@@ -130,6 +130,9 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 - Source-role, primary-narration, reference-timeline, shared-audio alignment, manual-anchor, and clock-drift metadata.
 - Synthetic multi-angle media fixtures with known offsets, orientation, audible/visible markers, and scripted step times.
 - Versioned processing-run manifests with redacted settings, source configuration, stage outcomes, counts, and failures.
+- Versioned neutral `Source`, `EvidenceItem`, and `ProcessingRun` contracts alongside the existing saved format.
+- Compatibility adapters for transcript spans, video frames, document pages, and uploaded still images, with evidence IDs retained on draft steps.
+- Conservative source-applicability review and conflict detection for torque, dimensions, part numbers, and safety directives.
 - Adaptive video sampling, OpenCV quality scoring, and candidate selection.
 - PDF page rendering, embedded-text extraction, scanned-page OCR, and page-level evidence records using local tools.
 - Draft questions and assembly-oriented section/step generation.
@@ -139,7 +142,7 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 ### Prototype Limitations
 
 - Assembly vocabulary and assumptions are embedded throughout processing and UI code.
-- Drawing interpretation does not yet extract title blocks, revisions, BOM tables, callouts, or technical conflicts.
+- Drawing interpretation does not yet extract title blocks, revisions, BOM tables, or callouts; current conflict detection is text-based and intentionally conservative.
 - Uploaded still-image analysis is not yet a complete production pipeline.
 - Multi-angle automatic alignment supports fixed offsets from shared audio and transcript words. Automatic waveform drift and visual-marker alignment are not yet implemented; manual end anchors correct drift.
 - Silent-video and weak-audio workflows need a deliberate segmentation strategy.
@@ -215,7 +218,7 @@ Build the evidence needed to prove and safely change the current model.
 
 Extract the product boundary without changing visible Assembly Assistant behavior.
 
-- Define `Source`, `EvidenceItem`, `ProcessingRun`, `ProcedureDraft`, `SectionDraft`, and `StepDraft` contracts.
+- Define `Source`, `EvidenceItem`, `ProcessingRun`, `ProcedureDraft`, `SectionDraft`, and `StepDraft` contracts. **Source, EvidenceItem, and ProcessingRun foundations complete.**
 - Define a domain-profile interface and registry.
 - Move assembly cue vocabulary, prompts, question policy, QA rules, and output mapping into an Assembly profile.
 - Add adapters between existing saved state and the neutral contracts.
@@ -312,10 +315,10 @@ Safety-critical inventions, incorrect torque/specification values, incorrect sof
 
 Complete Phase 0 and the compatibility groundwork for Phase 1 before creating another product UI.
 
-1. Freeze a representative assembly baseline set.
-2. Capture expected steps, timing, media, and critical fields.
-3. Add run/version metrics and repeatable evaluation output.
-4. Define neutral contracts and the domain-profile interface.
+1. Add semantic analysis for uploaded still images and rendered technical pages.
+2. Freeze a representative assembly baseline set when production media is available.
+3. Capture expected steps, timing, media, and critical fields.
+4. Define the remaining draft contracts and the domain-profile interface.
 5. Wrap current behavior as the first Assembly profile without changing the user-facing workflow.
 
 This is the safest route to reuse: prove the current product, isolate what is truly common, then build the next UX on a stable engine.

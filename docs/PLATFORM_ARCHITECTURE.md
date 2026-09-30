@@ -117,6 +117,8 @@ Functions should move only after their current behavior has baseline coverage. A
 
 ## Neutral Contracts
 
+Implementation status: version 1 `Source`, `EvidenceItem`, and `ProcessingRun` contracts now run alongside the existing Assembly Assistant saved structures. Current adapters cover transcript spans, scored video frames, rendered/OCR document pages, and uploaded still-image inventory. Procedure/section/step draft contracts and the formal profile interface remain next-stage work.
+
 ### Source
 
 A source identifies uploaded or generated material independently of a particular product UI.
@@ -220,6 +222,8 @@ The engine stores evidence; the domain profile applies source policy. A default 
 5. Unapproved reference material.
 
 Precedence is not permission to hide conflicts. If a video demonstrates an action that contradicts an applicable manual, the result must be a visible conflict requiring review.
+
+The current compatibility layer performs conservative text-based checks for torque, dimensions, part numbers, and safety directives. Sources with unresolved applicability are excluded from drafting. Conflicts retain all source claims and require an explicit question resolution or bypass; they do not carry an automatically selected value.
 
 ## Voiceover and Timeline Alignment
 

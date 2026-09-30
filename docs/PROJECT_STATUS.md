@@ -8,7 +8,7 @@ Prove and stabilize Assembly Assistant while creating a clean boundary for a reu
 
 ## Current Development Slice
 
-**Input foundation and synthetic synchronization lab - implemented and awaiting representative media validation**
+**Neutral evidence and source-policy foundation - implemented and awaiting representative media validation**
 
 - Stable source IDs and source roles.
 - One selected instruction-narration source to prevent duplicate multi-angle transcripts from affecting step boundaries.
@@ -24,15 +24,20 @@ Prove and stabilize Assembly Assistant while creating a clean boundary for a reu
 - Temporary FFmpeg fixtures for known offsets, portrait/landscape orientation, alternate angles, voiceover, audible/visible markers, and scripted step times.
 - Processing-run manifests containing engine/profile/prompt versions, redacted configuration, source setup, stage outcomes, timing, counts, alignment evidence, and failures.
 - Automated acceptance coverage confirms generated alternate-angle alignment within 0.5 seconds and preserves one drafting narration source.
+- Versioned neutral `Source`, `EvidenceItem`, and `ProcessingRun` contracts coexist with the existing job format.
+- Transcript spans, scored video frames, document pages, and uploaded images receive stable evidence IDs.
+- Draft steps preserve supporting transcript and media evidence IDs.
+- Uncertain document applicability blocks that source from drafting until the user explicitly approves its use.
+- Conflicting torque, dimension, part-number, and safety claims become questions; the system does not select a winner automatically.
 
 ## Next Authorized Work
 
 Work that does not require production recordings:
 
-1. Add document conflict and applicability scaffolding without making technical decisions automatically.
-2. Begin neutral `Source`, `EvidenceItem`, and `ProcessingRun` contracts alongside the existing saved format.
-3. Add semantic analysis for uploaded still images and rendered technical pages.
-4. Add visual sync-marker alignment as a fallback for silent or weak-audio multi-angle recordings.
+1. Add semantic analysis for uploaded still images and rendered technical pages.
+2. Define neutral procedure/section/step draft contracts and the first Assembly profile interface.
+3. Add visual sync-marker alignment as a fallback for silent or weak-audio multi-angle recordings.
+4. Add evidence visibility to section authoring so reviewers can inspect the source behind generated claims.
 
 Work that should wait for representative media:
 

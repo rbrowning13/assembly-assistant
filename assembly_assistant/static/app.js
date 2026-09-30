@@ -702,15 +702,28 @@
         const documents = (job.files || []).filter(file => ['pdf', 'text'].includes(file.kind) && !file.removed);
         const pages = stageArtifacts(job, 'pdf_page');
         const evidence = job.document_evidence || [];
+        const evidenceSummary = job.evidence_summary || {};
+        const conflicts = (job.evidence_conflicts || []).filter(item => item.status === 'open');
+        const applicabilityReviews = new Set(
+          (job.evidence_items || [])
+            .filter(item => item.evidence_type === 'document_page')
+            .filter(item => ['unspecified', 'review_required'].includes(item.applicability_review?.status || 'unspecified'))
+            .map(item => item.source_id)
+            .filter(Boolean)
+        );
         const textChars = evidence.reduce((sum, item) => sum + String(item.text || '').length, 0);
         body = `<div class="stage-detail-list">
           <div class="chip-row">
             <span class="chip">${documents.length} documents</span>
             <span class="chip">${pages.length} rendered pages</span>
             <span class="chip ${textChars ? 'good' : 'warn'}">${textChars} extracted characters</span>
+            <span class="chip">${esc(evidenceSummary.fact_count || 0)} technical facts</span>
+            <span class="chip ${applicabilityReviews.size ? 'warn' : 'good'}">${applicabilityReviews.size} applicability reviews</span>
+            <span class="chip ${conflicts.length ? 'bad' : 'good'}">${conflicts.length} source conflicts</span>
             <span class="chip warn">BOM/title-block interpretation not implemented</span>
           </div>
           <div class="file-list">${documents.map(file => `<div class="file-row"><div><div class="strong">${esc(file.name)}</div><div class="subtle">${esc(file.document_status || 'not processed')} · ${esc(file.document_page_count || 0)} pages · ${esc(file.authority_level || '')}${file.revision ? ' · rev ' + esc(file.revision) : ''}</div></div>${file.document_error ? `<span class="chip bad">${esc(file.document_error)}</span>` : ''}</div>`).join('') || '<div class="empty">No supporting documents attached.</div>'}</div>
+          ${conflicts.length ? `<div class="file-list">${conflicts.map(conflict => `<div class="file-row"><div><div class="strong">${esc(String(conflict.fact_type || 'technical').replaceAll('_', ' '))}: ${esc(conflict.subject || 'unspecified subject')}</div><div class="subtle">${(conflict.claims || []).map(claim => `${esc(claim.source_name || 'source')}: ${esc(claim.value || '')}`).join(' · ')}</div></div><span class="chip bad">Review required</span></div>`).join('')}</div>` : ''}
           ${pages.length ? `<div class="frame-grid">${pages.map(page => `<div class="frame-card clickable" onclick="openImageZoom('${jsSingleQuoted(page.stored_path)}', '${jsSingleQuoted((page.source_file || '') + ' page ' + (page.page_number || ''))}')"><img src="${mediaUrl(page.stored_path)}" alt="${esc(page.source_file || 'Document page')}"><div class="subtle">${esc(page.source_file || '')} · page ${esc(page.page_number || '')}<br>${esc(page.summary || '')}</div></div>`).join('')}</div>` : ''}
         </div>`;
       } else if (key === 'questions') {
@@ -929,6 +942,9 @@
       }
       if (alignment.method === 'transcript_word_match') {
         return `Auto · ${Number(alignment.offset_seconds || 0).toFixed(2)}s offset · ${esc(alignment.confidence || 'unknown')}`;
+      }
+      if (alignment.method === 'audio_waveform') {
+        return `Shared audio · ${Number(alignment.offset_seconds || 0).toFixed(2)}s offset · ${esc(alignment.confidence || 'unknown')}`;
       }
       return alignment.reason || 'Alignment will be calculated during transcription.';
     }
