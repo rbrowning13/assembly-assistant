@@ -1,469 +1,337 @@
-# Assembly Assistant Roadmap
+# Procedure Intelligence Platform Roadmap
 
-## Product Direction
+## Direction
 
-Assembly Assistant turns messy build content into reusable assembly instruction sections.
+Assembly Assistant remains a focused manufacturing-authoring product. It should not become a generic interface with assembly, software, service, and customer workflows mixed together.
 
-Core rule:
+The broader direction is a shared procedure-processing platform with separate products:
 
-> AI processes jobs into candidate sections. Humans edit sections and build packages.
+- **Assembly Assistant** - manufacturing assembly and production work instructions.
+- **Software Instructions** - procedures created from screen recordings and supporting documents.
+- **Field Service Authoring** - diagnostic, repair, test, and return-to-service procedures.
+- **Customer Instructions** - approved, customer-safe procedures derived from controlled content.
+- **Product Knowledge Assistant** - cited answers and troubleshooting guidance from an approved product corpus.
 
-The first product focus is processing quality and section writing. Reviews, permissions, reports, and the operator viewer come later.
+The shared core handles media and evidence. Each product owns its terminology, decisions, review rules, and user experience.
+
+The platform claim is not "any video becomes perfect instructions." The defensible claim is:
+
+> Narrated procedural media and supporting documents can be converted into evidence-linked draft instructions that a qualified person can review and approve.
+
+## Product Boundaries
+
+### Assembly Assistant
+
+Assembly Assistant continues to own:
+
+- Product, work area, station, assembly, and source-job metadata.
+- Parts and consumables.
+- Tools and torque.
+- Quality checks and safety callouts.
+- Manufacturing sections, packages, print output, and the future operator viewer.
+- Manufacturing review and approval rules.
+
+The existing assembly UX and package model are protected product behavior, not a temporary generic prototype.
+
+### Software Instructions
+
+Software instruction authoring gets its own UX and domain profile. It should understand:
+
+- Application, environment, version, and user role.
+- Access and prerequisite state.
+- Navigation paths, menus, tabs, buttons, fields, and entered values.
+- Expected screen results and verification.
+- Before/after screenshots and sensitive-data redaction.
+- Error recovery, exception paths, and escalation.
+
+It should not expose assembly-only fields such as torque, work cells, or parts unless a specific workflow extension requires them.
+
+### Field Service Authoring
+
+Field service authoring gets a technician-focused UX and profile. It should understand:
+
+- Machine family, model, serial range, configuration, and revision applicability.
+- Reported symptom, diagnostic path, root cause, corrective action, and verification.
+- Machine state, prerequisites, PPE, lockout/tagout, stored energy, and access hazards.
+- Tools, service parts, consumables, measurements, specifications, and tolerances.
+- Return-to-service criteria and escalation limits.
+
+Technical claims should be traceable to authoritative manuals, bulletins, drawings, specifications, or approved service knowledge.
+
+### Customer Instructions
+
+Customer instructions should be a controlled publication surface, not an unrestricted AI output mode. It should reuse approved field-service content while adding:
+
+- Customer-permitted versus technician-only work boundaries.
+- Reading-level and terminology controls.
+- Strong warning, prerequisite, and stop-work presentation.
+- Model and serial applicability.
+- Escalation and contact guidance.
+- Approval, revision, and publication controls.
+
+No generated procedure should publish directly to customers without a qualified approval step.
+
+### Product Knowledge Assistant
+
+The Product Knowledge Assistant is a related but separate product. It answers product, diagnostic, and troubleshooting questions using an approved corpus such as:
+
+- Owner and service manuals.
+- Service bulletins and technical specifications.
+- Approved work instructions.
+- Drawings, parts information, and revision records.
+- Curated field-service reports and resolved cases.
+
+It shares ingestion, OCR, evidence records, source versioning, permissions, and storage with the procedure platform. It needs a separate retrieval and answer service with:
+
+- Citations for claims and recommended actions.
+- Model, serial, configuration, and revision applicability.
+- Source authority and conflict handling.
+- Safety and role boundaries.
+- A clear refusal or escalation path when evidence is insufficient.
+
+It does not belong inside the Assembly Assistant job or package workflow.
+
+## Shared Platform
+
+See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction and integration design.
+
+### Shared Responsibilities
+
+- Upload intake, hashing, deduplication, and source identity.
+- Audio extraction and timestamped transcription.
+- Voiceover ingestion, selection, and timeline alignment.
+- Video probing, adaptive frame sampling, OpenCV scoring, and media selection.
+- Image normalization and analysis.
+- PDF/document rendering, OCR, tables, drawing callouts, and page coordinates.
+- Evidence records, source precedence, conflict detection, and provenance.
+- Neutral procedure, section, step, and processing-run contracts.
+- Provider adapters, retry behavior, logs, timings, cost metrics, and diagnostics.
+- Domain-profile execution and version tracking.
+
+### Product-Specific Responsibilities
+
+- Navigation, pages, terminology, and job setup.
+- Domain metadata and editor fields.
+- Prompt policy and drafting rules.
+- Question policy, QA checks, and completion gates.
+- Review, approval, permissions, publication, and retention policy.
+- Operator, technician, customer, or software-user viewers.
+- Product-specific print and export formats.
 
 ## Current State
 
-Built:
+### Built and Working
 
-- Local Flask browser app prototype
-- Jobs page with processing status columns
-- Job Review page
-- Background processing stages
-- Question cards before section drafting
-- Clarification files scoped to questions
-- Draft section output
-- Sections library
-- Section editor with QA, media correction, merge/split tools
-- Package builder and package preview/print preview
-- Settings page for OpenAI/local transcription configuration
+- Local Flask application with persisted jobs, sections, packages, settings, and media.
+- File upload, storage, hashing, deduplication, and rerun support.
+- FFmpeg media probing and audio extraction.
+- OpenAI and local Whisper transcription paths with timestamp handling.
+- Transcript cue parsing and support for multiple aligned video sources.
+- Adaptive video sampling, OpenCV quality scoring, and candidate selection.
+- Draft questions and assembly-oriented section/step generation.
+- Section authoring, QA checks, media correction, package building, and print preview.
+- Processing logs and visible job-stage progress.
 
-Current app URL:
+### Prototype Limitations
 
-- http://127.0.0.1:8765
+- Assembly vocabulary and assumptions are embedded throughout processing and UI code.
+- Drawing/PDF OCR is not yet a complete production pipeline.
+- Uploaded still-image analysis is not yet a complete production pipeline.
+- Silent-video and weak-audio workflows need a deliberate segmentation strategy.
+- Background work uses in-process threads and is not durable across process restarts.
+- SQLite currently stores a large application-state document rather than normalized records.
+- There is no representative regression/evaluation suite for instruction accuracy.
+- The core processing implementation is still concentrated in a large module.
+- Corporate rules for retention, confidential media, AI-provider use, and customer publication are not yet defined.
 
-Limitations:
+## Protection Rules
 
-- Storage is local-first and prototype-grade
-- Processing is still tuned for testing, not production scale
-- Review/approval permissions are not built yet
-- Operator console is not built yet
-- Automated PDF generation is not built yet; browser print is used for now
+The shared-engine work must follow these rules:
 
-## Core Objects
+1. Preserve the current Assembly Assistant workflow, fields, package snapshots, and saved data.
+2. Introduce neutral contracts and compatibility adapters before moving behavior.
+3. Establish baseline assembly jobs and expected outputs before refactoring processing.
+4. Add regression tests around timing, step boundaries, image selection, drafting, and package compatibility.
+5. Never replace the assembly prompt with one generic prompt intended to serve every domain.
+6. Do not make profile-specific fields mandatory in the shared core.
+7. Do not copy and diverge the processing pipeline between products.
+8. Do not introduce a network service until the package boundary is stable locally.
 
-### Job
+## Source and Evidence Model
 
-A temporary processing workspace.
+Supporting content must have an explicit authority level:
 
-Contains:
+1. **Authoritative** - approved manuals, released drawings, specifications, bulletins, and controlled procedures.
+2. **Primary evidence** - source video, chosen voiceover, screen recording, and direct operator/technician narration.
+3. **Supporting context** - 3D renders, reference photographs, draft documents, and related examples.
+4. **Reference only** - unapproved or uncertain material that can inform questions but cannot establish a technical claim.
 
-- job metadata
-- original uploaded content
-- processing status
-- AI questions
-- logs
-- draft sections
+Every generated step should retain, where available:
 
-Jobs should be archived when complete, not deleted.
+- Source ID, filename, revision, and authority level.
+- Transcript word/span timestamps and source audio track.
+- Video/frame timestamps and media-selection reason.
+- Document page, region, table, callout, or drawing reference.
+- Which content was directly supported and which wording was AI-normalized.
+- Confidence, conflicting evidence, and unresolved questions.
 
-### Question
+Conflicting authoritative sources must produce a review question or block publication. The system must not silently choose one.
 
-A structured decision the AI needs before drafting sections.
+## Voiceover Roadmap
 
-Contains:
+Voiceover support should cover three practical cases:
 
-- prompt
-- source reference
-- reason for asking
-- suggested choices
-- answer
-- optional clarification files
+1. **Replacement narration recorded while watching the source video** - same timeline and easiest alignment.
+2. **Separately uploaded voiceover with approximately the same duration** - align using audio features, pauses, and cue anchors.
+3. **Independent narration** - require semantic alignment plus user-confirmed anchors when confidence is low.
 
-Questions happen before section drafting.
+The UI should provide:
 
-### Section
+- Original, voiceover, or mixed transcript-source selection.
+- Start offset and at least one manual synchronization anchor.
+- Transcript preview with confidence and detected drift.
+- Preservation of both original and replacement audio as evidence.
 
-A reusable instruction building block.
+## Delivery Phases
 
-Contains:
+### Phase 0 - Core Model Proof and Baseline
 
-- title
-- metadata
-- tags
-- ordered steps
-- parts
-- tools
-- torque
-- safety
-- quality checks
-- media attachments
-- source job reference
+Build the evidence needed to prove and safely change the current model.
 
-Sections must be completed before use in packages.
+- Assemble representative assembly test jobs, including clutter, weak audio, long video, multiple angles, and supporting documents.
+- Record expected step boundaries, critical instructions, and acceptable media for each job.
+- Add processing-time, stage-time, model, prompt version, candidate-count, and cost metrics.
+- Define critical omissions and inventions as hard failures.
+- Add smoke tests for saved jobs, sections, package snapshots, and print output.
 
-### Package
+**Acceptance:** Runs can be compared to a baseline, critical omissions/inventions are measured, and existing saved content still loads.
 
-A human-built instruction set made from completed section versions.
+### Phase 1 - Neutral Contracts and Assembly Profile
 
-AI should not decide package structure.
+Extract the product boundary without changing visible Assembly Assistant behavior.
 
-## MVP Phase 1: UX Skeleton
+- Define `Source`, `EvidenceItem`, `ProcessingRun`, `ProcedureDraft`, `SectionDraft`, and `StepDraft` contracts.
+- Define a domain-profile interface and registry.
+- Move assembly cue vocabulary, prompts, question policy, QA rules, and output mapping into an Assembly profile.
+- Add adapters between existing saved state and the neutral contracts.
+- Persist profile ID, profile version, prompt version, and provider/model metadata with each processing run.
 
-Goal:
+**Acceptance:** Existing assembly jobs produce equivalent output, old packages still open, and the shared core does not require assembly-only fields.
 
-Tune the workflow before real processing makes the system harder to change.
+### Phase 2 - Real Supporting-Document Processing
 
-Build:
+- Render PDF pages and extract OCR text with coordinates.
+- Detect drawing title blocks, revision data, BOM tables, notes, and callouts where practical.
+- Extract text and structure from common office/text formats.
+- Analyze uploaded photographs and 3D render images.
+- Add source authority, revision, page, region, and conflict metadata.
+- Make document evidence available to questions, drafting, section editing, and citations.
 
-- Jobs table refinements
-- Job Review layout refinements
-- Question card UX
-- Section preview UX
-- Section library UX
-- Section editor first pass
-- Package builder first pass
+**Acceptance:** Generated claims can link to actual document evidence, and drawing/image stages no longer report simulated completion.
 
-Acceptance:
+### Phase 3 - Voiceover and Timeline Alignment
 
-- Riley can step through a fake job end to end
-- The workflow feels simple and visual
-- No screen feels overloaded
-- Progress always feels alive
+- Add replacement narration uploads and transcript-source controls.
+- Support offsets, anchors, drift detection, and confidence reporting.
+- Align multiple camera angles and voiceover to one reference timeline.
+- Preserve all original timing and provenance.
 
-## MVP Phase 2: Persistence
+**Acceptance:** A noisy source video can use a clean voiceover while frames remain aligned to the correct action.
 
-Goal:
+### Phase 4 - General Physical Procedure Profile
 
-Stop losing data on restart.
+Create a reusable physical-work profile for early validation outside assembly, while keeping Assembly Assistant unchanged.
 
-Build:
+- General action, object, tool, hazard, verification, and result vocabulary.
+- Configurable domain extensions for testing, machining, fabrication, paint, and maintenance.
+- A minimal evaluation harness that compares profile output on the same neutral evidence.
 
-- SQLite database
-- local storage folder
-- saved jobs
-- saved files
-- saved questions
-- saved answers
-- saved sections
-- saved package drafts
-- app settings
+**Acceptance:** The shared engine can produce a neutral physical procedure without assembly-specific output leaking into it.
 
-Recommended storage shape:
+### Phase 5 - Software Instruction Product
 
-```text
-storage/
-  jobs/
-    <job_id>/
-      originals/
-      audio/
-      frames/
-      thumbnails/
-      transcripts/
-      ocr/
-      analysis/
-  sections/
-  packages/
-```
+- Build a separate software-instruction job setup, review, editor, and export UX.
+- Add screen-event evidence, UI-element descriptions, OCR/redaction, and before/after screenshot selection.
+- Add software-specific QA for prerequisites, navigation, values, expected results, and recovery paths.
 
-Acceptance:
+**Acceptance:** Gina can create and correct a software procedure from a screen recording without seeing manufacturing-only controls.
 
-- Restarting the app preserves all work
-- Duplicate uploads are detected
-- Original files are never overwritten
+### Phase 6 - Field Service Product
 
-## MVP Phase 3: Real File Uploads
+- Build a technician-focused authoring UX and Field Service profile.
+- Add asset applicability, symptom/diagnostic structure, measurements, specifications, hazards, repair, and return-to-service verification.
+- Require authoritative evidence for safety-critical values and technical claims.
+- Add field-service review and release policy.
 
-Goal:
+**Acceptance:** A technician can turn service media and approved documents into a traceable draft procedure with explicit applicability and verification.
 
-Make jobs use real uploaded files.
+### Phase 7 - Product Knowledge and Troubleshooting Assistant
 
-Build:
+- Build an approved, versioned product corpus and ingestion workflow.
+- Chunk and index sources with product/model/serial/revision metadata.
+- Retrieve evidence using lexical, semantic, and structured filters.
+- Generate cited answers with conflict, applicability, safety, and escalation checks.
+- Add feedback and expert-curation workflow without allowing feedback to silently alter approved truth.
 
-- multipart upload handling
-- file hashing
-- duplicate detection
-- file type detection
-- upload status
-- add files to an existing job
-- add clarification files to a question
+**Acceptance:** Answers identify their sources and applicability, distinguish facts from diagnostic suggestions, and decline unsupported or unsafe guidance.
 
-Acceptance:
+### Phase 8 - Durable Shared Service
 
-- User can upload video, PDF, image, scan, and text files
-- Files are stored safely
-- Jobs can be rerun with added files
-- Exact duplicates are skipped
+Move from a local package to a shared service only after contracts and profiles are proven.
 
-## MVP Phase 4: Processing Framework
+- Durable queue and resumable processing runs.
+- Object storage and normalized metadata.
+- Authentication, authorization, audit history, and tenant/site boundaries.
+- Versioned API and backward-compatible contracts.
+- Central provider credentials, budgets, observability, and retention controls.
 
-Goal:
+**Acceptance:** Multiple products can submit work to the same engine without sharing UI state or duplicating processing code.
 
-Replace fake stages with real worker tasks without changing the UX.
+## Evaluation Program
 
-Build:
+Each domain needs its own test set and acceptance thresholds. Track at least:
 
-- processing task model
-- background worker
-- stage status updates
-- retry failed stage
-- cancel job
-- rerun job
-- advanced logs
-- error handling
+- Critical-step recall.
+- Unsupported or invented instruction rate.
+- Step ordering and boundary accuracy.
+- Transcript-to-frame timing error.
+- Primary-media acceptance rate.
+- Human edits per generated step.
+- Correctly surfaced ambiguities and conflicts.
+- Processing duration, retries, and cost per input minute.
+- Authoring time saved versus the existing manual process.
 
-Stages:
+Safety-critical inventions, incorrect torque/specification values, incorrect software values, and unsupported diagnostic actions are hard failures, not averageable quality scores.
 
-1. Upload check
-2. Transcription
-3. Drawing/PDF OCR
-4. Image review
-5. Video frame selection
-6. Question pass
-7. Draft section generation
+## Immediate Next Target
 
-Acceptance:
+Complete Phase 0 and the compatibility groundwork for Phase 1 before creating another product UI.
 
-- Processing runs outside web requests
-- User can leave the job page while it runs
-- Failed stages can be rerun
-- Jobs table updates progress clearly
+1. Freeze a representative assembly baseline set.
+2. Capture expected steps, timing, media, and critical fields.
+3. Add run/version metrics and repeatable evaluation output.
+4. Define neutral contracts and the domain-profile interface.
+5. Wrap current behavior as the first Assembly profile without changing the user-facing workflow.
 
-## MVP Phase 5: Transcription
+This is the safest route to reuse: prove the current product, isolate what is truly common, then build the next UX on a stable engine.
 
-Goal:
+## Decisions Made
 
-Build reliable audio extraction and transcription.
+- Assembly Assistant remains a dedicated manufacturing product.
+- Different instruction domains receive different UXs and domain profiles.
+- Processing infrastructure is shared; prompts, QA, metadata, approvals, and viewers are product-specific.
+- Supporting documents become weighted, cited evidence rather than undifferentiated attachments.
+- Voiceover is a first-class timed source and never destroys the original audio evidence.
+- The Product Knowledge Assistant is a separate retrieval product built on shared ingestion and evidence infrastructure.
+- Human review remains required before controlled manufacturing, service, or customer publication.
 
-Build:
+## Attention Needed
 
-- ffmpeg audio extraction
-- audio normalization
-- silence handling
-- chunking
-- per-chunk retries
-- timestamped transcript stitching
-- transcription provider adapter
+These are material product or governance decisions Riley and the company will need to make before the relevant phases:
 
-Initial providers:
-
-- OpenAI transcription API
-- optional local Whisper/faster-whisper later
-
-Acceptance:
-
-- A 10-minute build video produces a usable transcript
-- Failed chunks retry individually
-- Transcript timestamps can guide video analysis
-
-## MVP Phase 6: OCR and Drawing Review
-
-Goal:
-
-Extract useful manufacturing data from drawings, PDFs, and scans.
-
-Build:
-
-- PDF page rendering
-- OCR text extraction
-- title block detection
-- revision detection
-- BOM/table extraction
-- part number candidates
-- drawing callout candidates
-- AI cleanup and structuring
-
-Acceptance:
-
-- Drawing text is searchable
-- BOM-like content becomes candidate parts
-- Extracted data links back to source page
-
-## MVP Phase 7: Image and Video Processing
-
-Goal:
-
-Reduce media overload and select only useful visuals.
-
-Build:
-
-- image clarity scoring
-- duplicate/near-duplicate image detection
-- irrelevant image rejection
-- video keyframe extraction
-- scene/change detection
-- transcript-guided frame selection
-- useful frame ranking
-- rejected media drawer
-
-Acceptance:
-
-- User never has to sift through thousands of frames
-- AI recommends useful frames
-- Rejected frames are recoverable
-- Each recommended image has a reason
-
-## MVP Phase 8: AI Question Pass
-
-Goal:
-
-Ask only the questions needed to improve section drafting.
-
-Build:
-
-- question generation
-- confidence thresholds
-- source-linked questions
-- answer/bypass behavior
-- clarification file handling
-- rerun affected analysis after answers
-
-Question categories:
-
-- unclear tool
-- part identity
-- quality check candidate
-- safety callout candidate
-- drawing/transcript conflict
-- useful image confirmation
-- torque only when fastener context suggests torque may matter
-
-Acceptance:
-
-- Questions happen before drafting
-- The AI does not ask noisy questions
-- User can bypass tool/torque/quality/safety flags
-
-## MVP Phase 9: Section Drafting
-
-Goal:
-
-Turn reviewed evidence and question answers into candidate sections.
-
-Build:
-
-- section boundary detection
-- step drafting
-- part suggestions from BOM/OCR
-- tool suggestions
-- torque suggestions only when warranted
-- safety callouts
-- quality callouts
-- media suggestions per step
-- source traceability
-
-Acceptance:
-
-- Draft sections are usable starting points
-- Every step has linked evidence
-- User can approve, discard, split, or merge sections
-
-## MVP Phase 10: Section Editor
-
-Goal:
-
-Make sections production-ready.
-
-Build:
-
-- visual step editor
-- step media thumbnails
-- expandable image viewer
-- tools field
-- torque field
-- parts/consumables field
-- quality checks
-- safety notes
-- add manual attachments
-- duplicate section
-- mark complete
-
-Acceptance:
-
-- Sections can be polished without touching the original job
-- Completed sections become package-eligible
-- Manual attachments are not reprocessed unless explicitly requested
-
-## MVP Phase 11: Package Builder
-
-Goal:
-
-Let the manufacturing engineer build final instruction packages from completed sections.
-
-Build:
-
-- section search/filter
-- drag sections into package
-- reorder sections
-- package metadata
-- package preview
-- validation
-- freeze exact section versions
-
-Filters:
-
-- product
-- work area
-- station
-- tags
-- keyword
-- tool
-- part
-- safety/quality presence
-
-Acceptance:
-
-- AI does not build packages
-- User can visually assemble a package
-- Published package content is stable even if sections change later
-
-## Later Phases
-
-### Review Workflow
-
-- review assignments
-- role/dept queues
-- approvals
-- rejections
-- comments
-- revision history
-
-### Operator Viewer
-
-- tablet-friendly step viewer
-- current step text
-- tool callout
-- torque callout
-- quality callout
-- safety callout
-- thumbnail media strip
-- expandable image/drawing viewer
-- floor feedback capture
-
-### Reports
-
-- processing health
-- section usage
-- package revision history
-- common missing data
-- review aging
-
-### Network Deployment
-
-- server-hosted app
-- Postgres
-- shared file storage
-- login/roles
-- backups
-- audit trail
-
-## Immediate Next Steps
-
-Recommended order:
-
-1. Tune current UX prototype.
-2. Add a real Section Editor screen.
-3. Add persistence with SQLite.
-4. Add real file upload and storage.
-5. Build the processing task framework.
-6. Wire transcription first using the Lego video.
-7. Add PDF/image OCR.
-8. Add video frame selection.
-9. Add real AI question generation.
-10. Add real section drafting.
-
-Next build target:
-
-> Section Editor first pass, then SQLite persistence.
-
-Reason:
-
-The section is the core reusable product object. If the Section Editor feels wrong, the rest of the processing pipeline will generate content into the wrong shape.
+- Which corporate data may be sent to external AI providers and which must remain local.
+- Which source systems and document classes are authoritative for technical claims.
+- Who may approve assembly, technician, and customer-facing instructions.
+- Which operations customers may perform versus technician-only work.
+- Retention, access, and audit requirements for source video, reports, and generated content.
+- Whether Software Instructions or General Physical Procedures should be the first profile built after Assembly.
