@@ -87,9 +87,9 @@ DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS = 120
 FRAME_MANIFEST_NAME = "frame_manifest.json"
 FRAME_MANIFEST_VERSION = 2
 PROCESSING_MANIFEST_VERSION = 1
-ENGINE_VERSION = "assembly-assistant-core-0.3"
+ENGINE_VERSION = "assembly-assistant-core-0.4"
 ASSEMBLY_PROFILE_VERSION = "assembly-1"
-INSTRUCTION_PROMPT_VERSION = "assembly-draft-1"
+INSTRUCTION_PROMPT_VERSION = "assembly-draft-2"
 ADAPTIVE_BASE_SAMPLE_RATES = {
     "fast": 1.0,
     "standard": 2.0,
@@ -105,6 +105,10 @@ FRAME_ANALYSIS_BATCH_SIZE = 8
 FRAME_ANALYSIS_MAX_FRAMES = 420
 VIDEO_CANDIDATE_FRAME_LIMIT = 640
 SUPPLEMENTAL_FRAME_ANALYSIS_LIMIT = 80
+SEMANTIC_ANALYSIS_VERSION = "semantic-vision-1"
+SEMANTIC_IMAGE_BATCH_SIZE = 4
+SEMANTIC_DOCUMENT_PAGE_LIMIT = 80
+SEMANTIC_PREVIEW_MAX_PIXELS = 1800
 FRAME_ANALYSIS_PROFILE_BUDGETS = {
     "fast": {
         "frames_per_step": 4,
@@ -2313,6 +2317,8 @@ def refresh_processing_manifest(job, status=None, outcome=""):
         "timed_words": sum(len(item.get("words") or []) for item in transcript_results(job)),
         "raw_frames": sum(len(file.get("frame_paths") or []) for file in active_job_files(job)),
         "scored_frames": len(job.get("frame_analysis") or []),
+        "semantic_images": sum(1 for item in job.get("image_analysis") or [] if item.get("status") == "complete"),
+        "semantic_image_targets": len(job.get("image_analysis") or []),
         "sections": len(job.get("draft_sections") or []),
         "steps": sum(len(section.get("steps") or []) for section in job.get("draft_sections") or []),
         "questions": len(job.get("questions") or []),
@@ -4606,6 +4612,7 @@ def make_job(name, product, work_area, station, profile="Standard", files=None, 
         "questions": [],
         "question_review": {},
         "document_evidence": [],
+        "image_analysis": [],
         "source_contracts": [],
         "evidence_items": [],
         "evidence_facts": [],
@@ -4642,6 +4649,7 @@ def migrate_job_defaults(job):
     job.setdefault("frame_analysis", [])
     job.setdefault("question_review", {})
     job.setdefault("document_evidence", [])
+    job.setdefault("image_analysis", [])
     job.setdefault("source_contracts", [])
     job.setdefault("evidence_items", [])
     job.setdefault("evidence_facts", [])
@@ -4811,6 +4819,392 @@ def call_openai_frame_json(prompt, frames, model=None, timeout=240):
         return None, f"openai_http_{exc.code}: {detail[:500]}"
     except Exception as exc:
         return None, f"openai_error: {exc}"
+
+
+def call_openai_semantic_json(prompt, targets, model=None, timeout=240):
+    api_key = get_openai_api_key()
+    if not api_key:
+        return None, "missing_api_key"
+    content = [{"type": "input_text", "text": prompt}]
+    for target in targets:
+        preview_path = target.get("preview_path") or target.get("stored_path")
+        if not preview_path:
+            continue
+        context = [
+            f"Image {target.get('analysis_label')}: {target.get('source_file') or 'source image'}",
+            f"kind={target.get('evidence_type') or 'image'}",
+        ]
+        if target.get("page_number"):
+            context.append(f"page={target.get('page_number')}")
+        if target.get("context_text"):
+            context.append(f"OCR/text context={target.get('context_text')[:1200]}")
+        content.append({"type": "input_text", "text": " | ".join(context)})
+        try:
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": frame_data_url(preview_path),
+                    "detail": "high" if target.get("evidence_type") == "document_page" else "auto",
+                }
+            )
+        except Exception:
+            continue
+    if len(content) <= 1:
+        return None, "no_readable_images"
+    body = json.dumps(
+        {
+            "model": model or SETTINGS.get("instruction_model") or "gpt-4o-mini",
+            "input": [{"role": "user", "content": content}],
+            "text": {"format": {"type": "json_object"}},
+            "temperature": 0.1,
+        }
+    ).encode("utf-8")
+    req = urllib_request.Request(
+        "https://api.openai.com/v1/responses",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        text = extract_json_text_from_response(data)
+        if not text:
+            return None, "openai_no_json_text"
+        return json.loads(text), None
+    except urllib_error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return None, f"openai_http_{exc.code}: {detail[:500]}"
+    except Exception as exc:
+        return None, f"openai_error: {exc}"
+
+
+def semantic_analysis_targets(job):
+    targets = []
+    semantic_model = SETTINGS.get("instruction_model") or "gpt-4o-mini"
+    for file in active_job_files(job):
+        if file.get("kind") != "image" or not stored_path(file):
+            continue
+        targets.append(
+            {
+                "analysis_key": stable_contract_id(
+                    "sem",
+                    SEMANTIC_ANALYSIS_VERSION,
+                    semantic_model,
+                    file.get("source_id") or file.get("sha256") or file.get("name"),
+                    file.get("stored_path"),
+                ),
+                "source_id": file.get("source_id") or "",
+                "source_file": file.get("name") or "",
+                "stored_path": file.get("stored_path") or "",
+                "evidence_type": "uploaded_image",
+                "page_number": None,
+                "context_text": "",
+            }
+        )
+    document_targets = []
+    for record in job.get("document_evidence") or []:
+        if not record.get("stored_path") or not stored_relative_path(record.get("stored_path")):
+            continue
+        document_targets.append(
+            {
+                "analysis_key": stable_contract_id(
+                    "sem",
+                    SEMANTIC_ANALYSIS_VERSION,
+                    semantic_model,
+                    record.get("source_id") or record.get("source_file"),
+                    record.get("page_number"),
+                    record.get("stored_path"),
+                ),
+                "source_id": record.get("source_id") or "",
+                "source_file": record.get("source_file") or "",
+                "stored_path": record.get("stored_path") or "",
+                "evidence_type": "document_page",
+                "page_number": record.get("page_number"),
+                "context_text": (record.get("text") or "")[:2400],
+            }
+        )
+    if len(document_targets) > SEMANTIC_DOCUMENT_PAGE_LIMIT:
+        document_targets = sorted(
+            document_targets,
+            key=lambda item: (
+                not bool(re.search(r"\b(drawing|revision|rev\.?|bill of materials|bom|dimension|torque|warning|caution|note)\b", item.get("context_text") or "", re.IGNORECASE)),
+                int(item.get("page_number") or 0),
+            ),
+        )[:SEMANTIC_DOCUMENT_PAGE_LIMIT]
+    return targets + document_targets
+
+
+def prepare_semantic_preview(job, target):
+    source_path = stored_relative_path(target.get("stored_path"))
+    if not source_path:
+        return None, "source image missing"
+    if target.get("evidence_type") == "document_page":
+        return target.get("stored_path"), None
+
+    preview_dir = ensure_job_dirs(job)["analysis"] / "semantic_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    preview_path = preview_dir / f"{target.get('analysis_key')}.jpg"
+    if preview_path.exists() and preview_path.stat().st_size:
+        return str(preview_path.relative_to(APP_DIR)), None
+
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        try:
+            result = subprocess.run(
+                [
+                    ffmpeg,
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(source_path),
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    (
+                        f"scale={SEMANTIC_PREVIEW_MAX_PIXELS}:{SEMANTIC_PREVIEW_MAX_PIXELS}:"
+                        "force_original_aspect_ratio=decrease"
+                    ),
+                    "-q:v",
+                    "3",
+                    str(preview_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0 and preview_path.exists() and preview_path.stat().st_size:
+                return str(preview_path.relative_to(APP_DIR)), None
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    if cv2 is not None:
+        image = cv2.imread(str(source_path))
+        if image is not None:
+            height, width = image.shape[:2]
+            scale = min(1.0, SEMANTIC_PREVIEW_MAX_PIXELS / max(1, width, height))
+            if scale < 1:
+                image = cv2.resize(
+                    image,
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+            if cv2.imwrite(str(preview_path), image):
+                return str(preview_path.relative_to(APP_DIR)), None
+
+    if source_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"} and source_path.stat().st_size <= 15 * 1024 * 1024:
+        return target.get("stored_path"), None
+    return None, "image format could not be normalized for analysis"
+
+
+def semantic_local_metrics(rel_path):
+    metrics = {
+        "width": None,
+        "height": None,
+        "orientation": "unknown",
+        "clarity": None,
+        "brightness": None,
+        "local_tags": [],
+    }
+    path = stored_relative_path(rel_path)
+    if not path or cv2 is None:
+        return metrics
+    image = cv2.imread(str(path))
+    if image is None:
+        return metrics
+    height, width = image.shape[:2]
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blur = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    brightness = float(gray.mean())
+    orientation = "square" if abs(width - height) / max(width, height) < 0.08 else "landscape" if width > height else "portrait"
+    clarity = clamp_score(min(100, max(0, blur / 3.5)), 0)
+    tags = [orientation]
+    if brightness < 45:
+        tags.append("low_light")
+    elif brightness > 225:
+        tags.append("very_bright")
+    if clarity < 25:
+        tags.append("low_sharpness")
+    return {
+        "width": width,
+        "height": height,
+        "orientation": orientation,
+        "clarity": clarity,
+        "brightness": round(brightness, 1),
+        "local_tags": tags,
+    }
+
+
+def normalize_semantic_analysis(target, incoming=None, status="complete", error=""):
+    incoming = incoming or {}
+    local_metrics = target.get("local_metrics") or {}
+    tags = {
+        str(tag).strip().lower().replace(" ", "_")
+        for tag in [*(incoming.get("tags") or []), *(local_metrics.get("local_tags") or [])]
+        if str(tag).strip()
+    }
+    document = incoming.get("document") if isinstance(incoming.get("document"), dict) else {}
+    for key in ["title_block_present", "bom_table_present", "callouts_present", "dimensions_present", "notes_present"]:
+        if document.get(key):
+            tags.add(key.replace("_present", ""))
+    observed_items = [
+        re.sub(r"\s+", " ", str(item)).strip()[:120]
+        for item in (incoming.get("observed_items") or incoming.get("visible_components") or [])
+        if re.sub(r"\s+", " ", str(item)).strip()
+    ][:20]
+    candidate_identifiers = []
+    for item in incoming.get("candidate_identifiers") or []:
+        if not isinstance(item, dict):
+            continue
+        label = re.sub(r"\s+", " ", str(item.get("label") or "")).strip()[:80]
+        value = re.sub(r"\s+", " ", str(item.get("value") or "")).strip()[:160]
+        if label and value:
+            candidate_identifiers.append(
+                {
+                    "label": label,
+                    "value": value,
+                    "confidence": str(item.get("confidence") or "low").lower(),
+                }
+            )
+    return {
+        "analysis_key": target.get("analysis_key") or "",
+        "analysis_version": SEMANTIC_ANALYSIS_VERSION,
+        "source_id": target.get("source_id") or "",
+        "source_file": target.get("source_file") or "",
+        "stored_path": target.get("stored_path") or "",
+        "preview_path": target.get("preview_path") or "",
+        "evidence_type": target.get("evidence_type") or "uploaded_image",
+        "page_number": target.get("page_number"),
+        "status": status,
+        "visual_summary": re.sub(r"\s+", " ", str(incoming.get("visual_summary") or "")).strip()[:1000],
+        "observed_items": observed_items,
+        "viewpoint": re.sub(r"\s+", " ", str(incoming.get("viewpoint") or "")).strip()[:120],
+        "assembly_state": re.sub(r"\s+", " ", str(incoming.get("assembly_state") or "")).strip()[:160],
+        "visible_text_summary": re.sub(r"\s+", " ", str(incoming.get("visible_text_summary") or "")).strip()[:500],
+        "tags": sorted(tags),
+        "clarity": clamp_score(incoming.get("clarity"), local_metrics.get("clarity") or 0),
+        "instruction_value": clamp_score(incoming.get("instruction_value"), 40),
+        "confidence": str(incoming.get("confidence") or ("low" if status != "complete" else "medium")).lower(),
+        "document": {
+            "page_type": str(document.get("page_type") or "unknown").lower(),
+            "title_block_present": bool(document.get("title_block_present")),
+            "bom_table_present": bool(document.get("bom_table_present")),
+            "callouts_present": bool(document.get("callouts_present")),
+            "dimensions_present": bool(document.get("dimensions_present")),
+            "notes_present": bool(document.get("notes_present")),
+        },
+        "candidate_identifiers": candidate_identifiers,
+        "local_metrics": local_metrics,
+        "provider": "openai" if status == "complete" else "local",
+        "model": (SETTINGS.get("instruction_model") or "gpt-4o-mini") if status == "complete" else "",
+        "error": error[:500] if error else "",
+        "analyzed_at": datestamp(),
+    }
+
+
+def fallback_semantic_analysis(target, error=""):
+    incoming = {
+        "visual_summary": (
+            f"Rendered page {target.get('page_number')} from {target.get('source_file')}."
+            if target.get("evidence_type") == "document_page"
+            else f"Uploaded reference image {target.get('source_file')}."
+        ),
+        "tags": [target.get("evidence_type") or "image"],
+        "clarity": (target.get("local_metrics") or {}).get("clarity") or 0,
+        "instruction_value": 30,
+        "confidence": "low",
+    }
+    status = "unreadable" if not target.get("preview_path") else "local_only"
+    return normalize_semantic_analysis(target, incoming, status=status, error=error)
+
+
+def analyze_semantic_batch(job, targets):
+    prompt = f"""
+Analyze these supporting images for a manufacturing instruction-authoring job.
+Product: {job.get('product') or 'not specified'}
+Work area: {job.get('work_area') or 'not specified'}
+
+Describe only what is visibly supported. Do not infer hidden parts, dimensions, torque values, drawing revisions,
+part numbers, safety requirements, or approval status. If text is unreadable, say so. Candidate identifiers are
+unverified visual observations and must not be treated as released technical values.
+
+For uploaded photographs or renders, identify useful visible components, viewpoint, assembly state, clarity,
+and whether the image could support an instruction. For rendered document pages, classify the page and identify
+whether a title block, BOM-like table, callouts, dimensions, or notes are visibly present. Use supplied OCR only
+as context; do not repeat exact technical values into the visual summary.
+
+Return JSON only:
+{{
+  "images": [
+    {{
+      "analysis_label": "S001",
+      "visual_summary": "objective visual description",
+      "observed_items": ["visible component or region"],
+      "viewpoint": "front/side/top/detail/unknown",
+      "assembly_state": "before/after/completed/in-progress/reference/unknown",
+      "visible_text_summary": "general text types visible, without technical values",
+      "tags": ["reference_photo", "detail_view"],
+      "clarity": 0,
+      "instruction_value": 0,
+      "confidence": "high/medium/low",
+      "document": {{
+        "page_type": "technical_drawing/manual_page/bom/schematic/photo/unknown",
+        "title_block_present": false,
+        "bom_table_present": false,
+        "callouts_present": false,
+        "dimensions_present": false,
+        "notes_present": false
+      }},
+      "candidate_identifiers": [
+        {{"label": "drawing number/revision/model/other", "value": "visible candidate", "confidence": "high/medium/low"}}
+      ]
+    }}
+  ]
+}}
+"""
+    data, error = call_openai_semantic_json(prompt, targets)
+    if error:
+        return [], error
+    by_label = {
+        str(item.get("analysis_label") or "").strip(): item
+        for item in (data or {}).get("images") or []
+        if str(item.get("analysis_label") or "").strip()
+    }
+    missing_labels = [
+        target.get("analysis_label")
+        for target in targets
+        if target.get("analysis_label") not in by_label
+    ]
+    if missing_labels:
+        return [], f"semantic_response_missing_{len(missing_labels)}_images"
+    return [
+        normalize_semantic_analysis(target, by_label.get(target.get("analysis_label")))
+        for target in targets
+    ], None
+
+
+def apply_semantic_analysis(job):
+    by_path = {
+        item.get("stored_path"): item
+        for item in job.get("image_analysis") or []
+        if item.get("stored_path")
+    }
+    for file in active_job_files(job):
+        if file.get("kind") != "image":
+            continue
+        analysis = by_path.get(file.get("stored_path"))
+        if analysis:
+            file["semantic_analysis"] = analysis
+            file["image_status"] = analysis.get("status") or "analyzed"
+    for record in job.get("document_evidence") or []:
+        analysis = by_path.get(record.get("stored_path"))
+        if analysis:
+            record["semantic_analysis"] = analysis
 
 
 def clamp_score(value, default=0):
@@ -5027,6 +5421,7 @@ Rules:
 - Use supporting-document facts only when the quoted evidence applies to this product/configuration.
 - Prefer authoritative sources over supporting context. Surface contradictions instead of silently choosing one.
 - Cite only evidence IDs shown below. Every technical value taken from a document must include its evidence ID.
+- Supporting visual observations may clarify visible components, viewpoint, or assembly state, but must not establish exact technical values.
 - Open source conflicts are unresolved. Do not select a value unless the Question answers explicitly resolve it.
 - Do not invent technical values when a document is absent, unreadable, revision-unknown, or ambiguous.
 - Use only these frame paths in media: {json.dumps(frames[:160])}
@@ -5058,6 +5453,9 @@ Transcript excerpt:
 
 Supporting document evidence:
 {supporting_context or "None processed"}
+
+Supporting visual evidence:
+{supporting_visual_context(job) or "None processed"}
 
 Open source conflicts:
 {evidence_conflict_context(job) or "None"}
@@ -6251,7 +6649,9 @@ def document_context(job, max_chars=7000):
         if neutral and review_status in {"unspecified", "review_required", "not_applicable"}:
             continue
         text = (evidence.get("text") or "").strip()
-        if not text:
+        semantic = evidence.get("semantic_analysis") or {}
+        visual_summary = (semantic.get("visual_summary") or "").strip()
+        if not text and not visual_summary:
             continue
         heading = (
             f"Evidence: {evidence.get('evidence_id') or 'unassigned'}"
@@ -6265,7 +6665,13 @@ def document_context(job, max_chars=7000):
         remaining = max_chars - used - len(heading) - 2
         if remaining <= 0:
             break
-        block = f"{heading}\n{text[:remaining]}"
+        context_parts = []
+        if visual_summary:
+            context_parts.append(f"Visual observation (not a verified technical value): {visual_summary}")
+        if text:
+            context_parts.append(text)
+        context_text = "\n".join(context_parts)[:remaining]
+        block = f"{heading}\n{context_text}"
         blocks.append(block)
         used += len(block) + 2
     return "\n\n".join(blocks)
@@ -6287,6 +6693,11 @@ def refresh_job_evidence(job):
     normalize_job_sources(job)
     contracts, sources = source_contract_map(job)
     applicability_resolutions = job.get("evidence_applicability_resolutions") or {}
+    semantic_by_path = {
+        item.get("stored_path"): item
+        for item in job.get("image_analysis") or []
+        if item.get("stored_path")
+    }
     items = []
     seen = set()
 
@@ -6331,6 +6742,9 @@ def refresh_job_evidence(job):
         source = sources.get(record.get("source_id")) or sources.get(record.get("source_file"))
         if not source:
             continue
+        semantic = semantic_by_path.get(record.get("stored_path")) or record.get("semantic_analysis") or {}
+        semantic_tags = semantic.get("tags") or []
+        page_type = (semantic.get("document") or {}).get("page_type")
         item = evidence_item(
             evidence_type="document_page",
             source=source,
@@ -6339,14 +6753,21 @@ def refresh_job_evidence(job):
                 "storage_ref": record.get("stored_path") or "",
             },
             text=record.get("text") or "",
-            summary=(record.get("text") or "")[:240],
-            tags=["supporting_document", record.get("extraction_method") or ""],
+            summary=semantic.get("visual_summary") or (record.get("text") or "")[:240],
+            tags=[
+                "supporting_document",
+                record.get("extraction_method") or "",
+                *(semantic_tags or []),
+                page_type or "",
+            ],
             confidence="high" if record.get("extraction_method") == "embedded_text" else "medium",
             extraction_method=record.get("extraction_method") or "render_only",
             product=job.get("product") or "",
         )
         record["evidence_id"] = item["evidence_id"]
         record["applicability_review"] = item["applicability_review"]
+        if semantic:
+            record["semantic_analysis"] = semantic
         add(item)
 
     frame_sources = {
@@ -6386,15 +6807,21 @@ def refresh_job_evidence(job):
         source = sources.get(file.get("source_id"))
         if not source:
             continue
+        semantic = semantic_by_path.get(file.get("stored_path")) or file.get("semantic_analysis") or {}
+        semantic_ready = semantic.get("status") == "complete"
         add(
             evidence_item(
                 evidence_type="uploaded_image",
                 source=source,
                 locator={"storage_ref": file.get("stored_path") or ""},
-                summary=file.get("name") or "Uploaded reference image",
-                tags=["uploaded_image", "semantic_analysis_pending"],
-                confidence="unreviewed",
-                extraction_method="upload_inventory",
+                summary=semantic.get("visual_summary") or file.get("name") or "Uploaded reference image",
+                tags=[
+                    "uploaded_image",
+                    *(semantic.get("tags") or []),
+                    "semantic_analysis_complete" if semantic_ready else "semantic_analysis_local_only",
+                ],
+                confidence=semantic.get("confidence") or "unreviewed",
+                extraction_method="semantic_vision" if semantic_ready else "upload_inventory",
                 product=job.get("product") or "",
             )
         )
@@ -6468,6 +6895,34 @@ def evidence_conflict_context(job, max_conflicts=12):
             f"{conflict.get('conflict_id')} | {conflict.get('fact_type')} | {conflict.get('subject')} | {claims}"
         )
         if len(lines) >= max_conflicts:
+            break
+    return "\n".join(lines)
+
+
+def supporting_visual_context(job, max_items=30):
+    evidence_by_path = {
+        (item.get("locator") or {}).get("storage_ref"): item
+        for item in job.get("evidence_items") or []
+        if (item.get("locator") or {}).get("storage_ref")
+    }
+    lines = []
+    for analysis in job.get("image_analysis") or []:
+        if analysis.get("status") != "complete" or not analysis.get("visual_summary"):
+            continue
+        evidence = evidence_by_path.get(analysis.get("stored_path")) or {}
+        if analysis.get("evidence_type") == "document_page":
+            applicability = (evidence.get("applicability_review") or {}).get("status")
+            if applicability not in {"applicable", "supporting_only"}:
+                continue
+        observed = ", ".join(analysis.get("observed_items") or [])
+        tags = ", ".join(analysis.get("tags") or [])
+        page_label = f" page {analysis.get('page_number')}" if analysis.get("page_number") else ""
+        lines.append(
+            f"{evidence.get('evidence_id') or 'unassigned'} | "
+            f"{analysis.get('source_file') or 'image'}{page_label} | "
+            f"{analysis.get('visual_summary')} | observed: {observed or 'none listed'} | tags: {tags or 'none'}"
+        )
+        if len(lines) >= max_items:
             break
     return "\n".join(lines)
 
@@ -6562,16 +7017,176 @@ def run_document_stage(job_id):
 def run_image_inventory_stage(job_id):
     with STATE_LOCK:
         job = JOBS[job_id]
-        set_stage(job, "images", "running", 20, "Cataloging uploaded images")
-        images = [file for file in active_job_files(job) if file.get("kind") == "image" and stored_path(file)]
-        for file in images:
-            file["image_status"] = "available for manual evidence selection"
-        refresh_job_evidence(job)
-        note = f"{len(images)} uploaded images cataloged"
-        if images:
-            note += " · semantic image analysis pending"
+        set_stage(job, "images", "running", 8, "Preparing visual evidence")
+        job["status"] = "Processing"
+        targets = semantic_analysis_targets(job)
+        existing = {
+            item.get("analysis_key"): item
+            for item in job.get("image_analysis") or []
+            if item.get("analysis_key")
+        }
+        job_snapshot = json.loads(json.dumps(job))
+        uploaded_count = sum(1 for target in targets if target.get("evidence_type") == "uploaded_image")
+        page_count = sum(1 for target in targets if target.get("evidence_type") == "document_page")
+        rendered_page_count = sum(
+            1
+            for record in job.get("document_evidence") or []
+            if record.get("stored_path")
+        )
+        add_log(
+            job,
+            f"Visual evidence analysis started: {uploaded_count} uploaded images · {page_count} rendered pages.",
+        )
+
+    if not targets:
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            job["image_analysis"] = []
+            refresh_job_evidence(job)
+            set_stage(job, "images", "done", 100, "No uploaded images or rendered pages")
+            add_log(job, "Visual evidence analysis complete: no analyzable images.")
+        return True
+
+    provider_available = bool(get_openai_api_key())
+    prepared = []
+    for index, target in enumerate(targets, start=1):
+        preview_path, preview_error = prepare_semantic_preview(job_snapshot, target)
+        target["preview_path"] = preview_path or ""
+        target["preview_error"] = preview_error or ""
+        target["local_metrics"] = semantic_local_metrics(preview_path or target.get("stored_path"))
+        target["analysis_label"] = f"S{index:03d}"
+        prepared.append(target)
+
+    reusable = []
+    pending = []
+    for target in prepared:
+        cached = existing.get(target.get("analysis_key"))
+        cache_usable = bool(
+            cached
+            and cached.get("analysis_version") == SEMANTIC_ANALYSIS_VERSION
+            and (
+                cached.get("status") == "complete"
+                or (not provider_available and cached.get("status") == "local_only")
+            )
+        )
+        if cache_usable:
+            reusable.append(cached)
+        else:
+            pending.append(target)
+
+    results = list(reusable)
+    failures = 0
+    batches = [
+        pending[start:start + SEMANTIC_IMAGE_BATCH_SIZE]
+        for start in range(0, len(pending), SEMANTIC_IMAGE_BATCH_SIZE)
+    ]
+
+    def analyze_batch(batch):
+        readable = [target for target in batch if target.get("preview_path")]
+        unreadable = [target for target in batch if not target.get("preview_path")]
+        batch_results = [
+            fallback_semantic_analysis(target, target.get("preview_error") or "image unreadable")
+            for target in unreadable
+        ]
+        if not readable:
+            return batch_results, "no_readable_images"
+        if not provider_available:
+            batch_results.extend(
+                fallback_semantic_analysis(target, "OpenAI semantic analysis is not configured")
+                for target in readable
+            )
+            return batch_results, "missing_api_key"
+        provider_results, error = analyze_semantic_batch(job_snapshot, readable)
+        if error:
+            batch_results.extend(fallback_semantic_analysis(target, error) for target in readable)
+            return batch_results, error
+        batch_results.extend(provider_results)
+        return batch_results, None
+
+    completed_pending = 0
+    if batches:
+        with ThreadPoolExecutor(max_workers=min(2, len(batches))) as executor:
+            future_map = {executor.submit(analyze_batch, batch): batch for batch in batches}
+            for future in as_completed(future_map):
+                batch = future_map[future]
+                try:
+                    batch_results, error = future.result()
+                except Exception as exc:
+                    error = f"semantic_batch_exception: {exc}"
+                    batch_results = [fallback_semantic_analysis(target, error) for target in batch]
+                results.extend(batch_results)
+                completed_pending += len(batch)
+                if error and error != "missing_api_key":
+                    failures += 1
+                with STATE_LOCK:
+                    job = JOBS[job_id]
+                    by_key = {
+                        item.get("analysis_key"): item
+                        for item in [*(job.get("image_analysis") or []), *batch_results]
+                        if item.get("analysis_key")
+                    }
+                    job["image_analysis"] = list(by_key.values())
+                    apply_semantic_analysis(job)
+                    percent = 18 + round(completed_pending / max(1, len(pending)) * 72)
+                    set_stage(
+                        job,
+                        "images",
+                        "running",
+                        min(94, percent),
+                        f"{len(reusable) + completed_pending}/{len(prepared)} images analyzed",
+                    )
+                    add_log(
+                        job,
+                        f"Visual analysis batch saved: {len(batch_results)} images"
+                        + (f" · provider issue: {error}" if error and error != "missing_api_key" else ""),
+                    )
+
+    result_by_key = {
+        item.get("analysis_key"): item
+        for item in results
+        if item.get("analysis_key")
+    }
+    ordered_results = [
+        result_by_key[target.get("analysis_key")]
+        for target in prepared
+        if target.get("analysis_key") in result_by_key
+    ]
+    with STATE_LOCK:
+        job = JOBS[job_id]
+        job["image_analysis"] = ordered_results
+        apply_semantic_analysis(job)
+        evidence_summary = refresh_job_evidence(job)
+        complete_count = sum(1 for item in ordered_results if item.get("status") == "complete")
+        local_count = sum(1 for item in ordered_results if item.get("status") == "local_only")
+        unreadable_count = sum(1 for item in ordered_results if item.get("status") == "unreadable")
+        note = f"{uploaded_count} uploaded images · {page_count} rendered pages · {complete_count} semantically analyzed"
+        if reusable:
+            note += f" · {len(reusable)} reused"
+        if local_count:
+            note += f" · {local_count} local only"
+        if unreadable_count:
+            note += f" · {unreadable_count} unreadable"
+        if rendered_page_count > page_count:
+            note += f" · {rendered_page_count - page_count} pages deferred by safety ceiling"
+        if failures or unreadable_count:
+            flags = job.setdefault("flags", [])
+            if "Visual analysis issue" not in flags:
+                flags.append("Visual analysis issue")
+        elif "Visual analysis issue" in job.get("flags", []):
+            job["flags"].remove("Visual analysis issue")
+        cache = job.setdefault("processing_cache", {})
+        cache["semantic_images"] = {
+            "version": SEMANTIC_ANALYSIS_VERSION,
+            "targets": len(prepared),
+            "analyzed": complete_count,
+            "reused": len(reusable),
+            "local_only": local_count,
+            "unreadable": unreadable_count,
+            "evidence_items": evidence_summary.get("evidence_count") or 0,
+            "updated_at": datestamp(),
+        }
         set_stage(job, "images", "done", 100, note)
-        add_log(job, f"Image inventory complete: {note}.")
+        add_log(job, f"Visual evidence analysis complete: {note}.")
     return True
 
 
@@ -7303,12 +7918,24 @@ def rerun_stage_worker(job_id, stage_key):
         with STATE_LOCK:
             reset_stages_from(JOBS[job_id], "drawings")
         run_document_stage(job_id)
+        run_image_inventory_stage(job_id)
         with STATE_LOCK:
             job = JOBS[job_id]
             job["status"] = "Needs Attention"
             if "Draft may need rerun" not in job["flags"]:
                 job["flags"].append("Draft may need rerun")
             add_log(job, "Document rerun complete. Rerun Drafts if supporting evidence changed.")
+        return
+    if stage_key == "images":
+        with STATE_LOCK:
+            reset_stages_from(JOBS[job_id], "images")
+        run_image_inventory_stage(job_id)
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            job["status"] = "Needs Attention"
+            if "Draft may need rerun" not in job["flags"]:
+                job["flags"].append("Draft may need rerun")
+            add_log(job, "Visual evidence rerun complete. Rerun Drafts if supporting evidence changed.")
         return
     if stage_key == "video":
         with STATE_LOCK:
@@ -7343,7 +7970,7 @@ def rerun_stage_worker(job_id, stage_key):
 
 
 def rerun_job_stage(job_id, stage_key):
-    allowed = {"transcription", "drawings", "video", "draft_sections", "media_assignment"}
+    allowed = {"transcription", "drawings", "images", "video", "draft_sections", "media_assignment"}
     if stage_key not in allowed:
         return False
     with STATE_LOCK:
@@ -7758,9 +8385,10 @@ def section_current_media(section):
     return used
 
 
-def media_option_record(path, kind, source_file="", timestamp_seconds=None, label="", tags=None, score=0, reason="", summary="", used=None):
+def media_option_record(path, kind, source_file="", timestamp_seconds=None, label="", tags=None, score=0, reason="", summary="", used=None, preview_path=""):
     return {
         "path": path,
+        "preview_path": preview_path or "",
         "kind": kind,
         "source_file": source_file or "",
         "timestamp_seconds": timestamp_seconds,
@@ -7770,7 +8398,7 @@ def media_option_record(path, kind, source_file="", timestamp_seconds=None, labe
         "reason": reason or "",
         "summary": summary or "",
         "is_currently_used": path in (used or set()),
-        "previewable": previewable_media_path(path),
+        "previewable": previewable_media_path(preview_path or path),
     }
 
 
@@ -7782,6 +8410,11 @@ def section_media_options(section):
         analysis_by_path = {
             item.get("stored_path"): item
             for item in job.get("frame_analysis", [])
+            if item.get("stored_path")
+        }
+        semantic_by_path = {
+            item.get("stored_path"): item
+            for item in job.get("image_analysis") or []
             if item.get("stored_path")
         }
         for artifact in frame_artifacts(job):
@@ -7817,32 +8450,36 @@ def section_media_options(section):
         for file in active_job_files(job):
             path = file.get("stored_path")
             if file.get("kind") == "image" and path:
+                semantic = semantic_by_path.get(path) or file.get("semantic_analysis") or {}
                 options[path] = media_option_record(
                     path,
                     "image",
                     file.get("name") or "",
                     None,
                     file.get("name") or Path(path).name,
-                    ["uploaded", "image"],
-                    50,
-                    file.get("processing_status") or "",
-                    file.get("name") or "",
+                    ["uploaded", "image", *(semantic.get("tags") or [])],
+                    semantic.get("instruction_value", 50),
+                    semantic.get("status") or file.get("processing_status") or "",
+                    semantic.get("visual_summary") or file.get("name") or "",
                     used,
+                    semantic.get("preview_path") or "",
                 )
         for artifact in job.get("artifacts", []):
             path = artifact.get("stored_path")
             if artifact.get("kind") in {"drawing", "drawing_page", "pdf_page", "image"} and path:
+                semantic = semantic_by_path.get(path) or {}
                 options[path] = media_option_record(
                     path,
                     artifact.get("kind"),
                     artifact.get("source_file") or "",
                     artifact.get("timestamp_seconds"),
                     artifact.get("name") or Path(path).name,
-                    [artifact.get("kind")],
-                    artifact.get("instruction_value", 0),
-                    artifact.get("candidate_reason") or artifact.get("processing_status") or "",
-                    artifact.get("summary") or artifact.get("processing_status") or "",
+                    [artifact.get("kind"), *(semantic.get("tags") or [])],
+                    semantic.get("instruction_value", artifact.get("instruction_value", 0)),
+                    semantic.get("status") or artifact.get("candidate_reason") or artifact.get("processing_status") or "",
+                    semantic.get("visual_summary") or artifact.get("summary") or artifact.get("processing_status") or "",
                     used,
+                    semantic.get("preview_path") or "",
                 )
     for media in section.get("media_uploads") or []:
         path = media.get("stored_path")
@@ -7970,8 +8607,13 @@ def job_processing_health(job):
     if media_selection.get("fallback_image_steps"):
         warnings.append(f"{media_selection.get('fallback_image_steps')} steps use fallback media")
     evidence_summary = job.get("evidence_summary") or {}
+    semantic_analysis = job.get("image_analysis") or []
+    semantic_complete = sum(1 for item in semantic_analysis if item.get("status") == "complete")
+    semantic_unreadable = sum(1 for item in semantic_analysis if item.get("status") == "unreadable")
     if evidence_summary.get("open_conflicts"):
         warnings.append(f"{evidence_summary.get('open_conflicts')} technical source conflicts require review")
+    if semantic_unreadable:
+        warnings.append(f"{semantic_unreadable} visual evidence items are unreadable")
     if job.get("watchdog", {}).get("stage"):
         warnings.append("Watchdog has recent processing state")
     return {
@@ -7987,6 +8629,8 @@ def job_processing_health(job):
         "evidence_items": evidence_summary.get("evidence_count") or 0,
         "evidence_facts": evidence_summary.get("fact_count") or 0,
         "evidence_conflicts": evidence_summary.get("open_conflicts") or 0,
+        "semantic_images": semantic_complete,
+        "semantic_image_targets": len(semantic_analysis),
         "warnings": warnings,
     }
 

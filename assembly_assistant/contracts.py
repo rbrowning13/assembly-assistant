@@ -188,7 +188,9 @@ def _normalized_unit(unit):
 
 
 def technical_facts(item):
-    text = item.get("text") or item.get("summary") or ""
+    if item.get("evidence_type") not in {"document_page", "transcript_span"}:
+        return []
+    text = item.get("text") or ""
     facts = []
     for sentence_match in SENTENCE_RE.finditer(text):
         sentence = re.sub(r"\s+", " ", sentence_match.group(0)).strip()

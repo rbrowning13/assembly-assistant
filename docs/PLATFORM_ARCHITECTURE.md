@@ -117,7 +117,7 @@ Functions should move only after their current behavior has baseline coverage. A
 
 ## Neutral Contracts
 
-Implementation status: version 1 `Source`, `EvidenceItem`, and `ProcessingRun` contracts now run alongside the existing Assembly Assistant saved structures. Current adapters cover transcript spans, scored video frames, rendered/OCR document pages, and uploaded still-image inventory. Procedure/section/step draft contracts and the formal profile interface remain next-stage work.
+Implementation status: version 1 `Source`, `EvidenceItem`, and `ProcessingRun` contracts now run alongside the existing Assembly Assistant saved structures. Current adapters cover transcript spans, scored video frames, rendered/OCR document pages, and semantically analyzed uploaded still images. Procedure/section/step draft contracts and the formal profile interface remain next-stage work.
 
 ### Source
 
@@ -204,6 +204,8 @@ Supporting files should not be flattened into one text prompt. Ingestion should 
 - Extract visual summaries, visible components, viewpoints, labels, and quality metrics.
 - Mark renders as supporting context unless the organization explicitly designates them as controlled technical sources.
 - Allow a reviewer to select them as primary or supporting media without changing the original.
+
+Current implementation normalizes analysis previews without changing originals, records local image-quality metadata, and generates conservative visual summaries. AI-read identifiers remain candidates only; they are not accepted as technical facts or allowed to override OCR/released source text.
 
 ### Reports and Prior Instructions
 

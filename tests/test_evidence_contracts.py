@@ -1,4 +1,6 @@
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from assembly_assistant import core
 from assembly_assistant.contracts import (
@@ -275,6 +277,172 @@ class EvidenceContractTests(unittest.TestCase):
 
         self.assertEqual(job["evidence_conflicts"][0]["status"], "resolved")
         self.assertEqual(job["evidence_conflicts"][0]["resolution"]["answer"], "Use manual-a.txt: 25 n-m")
+
+    def test_semantic_targets_include_uploads_and_prioritize_document_pages(self):
+        job = {
+            "id": "job-semantic-targets",
+            "files": [
+                {
+                    "source_id": "src-image",
+                    "name": "reference.jpg",
+                    "kind": "image",
+                    "stored_path": "storage/reference.jpg",
+                }
+            ],
+            "document_evidence": [
+                {
+                    "source_id": "src-doc",
+                    "source_file": "drawing.pdf",
+                    "page_number": index,
+                    "stored_path": f"storage/page-{index}.jpg",
+                    "text": "Released drawing revision note" if index == 90 else "General page",
+                }
+                for index in range(1, 91)
+            ],
+        }
+
+        with patch.object(core, "stored_path", return_value=Path("/tmp/source.jpg")), patch.object(
+            core,
+            "stored_relative_path",
+            return_value=Path("/tmp/page.jpg"),
+        ):
+            targets = core.semantic_analysis_targets(job)
+
+        self.assertEqual(len(targets), 1 + core.SEMANTIC_DOCUMENT_PAGE_LIMIT)
+        self.assertEqual(targets[0]["evidence_type"], "uploaded_image")
+        self.assertTrue(any(target.get("page_number") == 90 for target in targets))
+
+    def test_semantic_analysis_normalization_is_conservative_and_structured(self):
+        target = {
+            "analysis_key": "sem-1",
+            "source_id": "src-image",
+            "source_file": "reference.jpg",
+            "stored_path": "storage/reference.jpg",
+            "preview_path": "storage/reference-preview.jpg",
+            "evidence_type": "uploaded_image",
+            "local_metrics": {"clarity": 72, "local_tags": ["landscape"]},
+        }
+        analysis = core.normalize_semantic_analysis(
+            target,
+            {
+                "visual_summary": "Top view of an assembled housing.",
+                "observed_items": ["housing", "fastener"],
+                "tags": ["reference photo"],
+                "clarity": 80,
+                "instruction_value": 65,
+                "document": {"title_block_present": True, "page_type": "technical_drawing"},
+                "candidate_identifiers": [
+                    {"label": "drawing number", "value": "ABC-123", "confidence": "medium"}
+                ],
+            },
+        )
+
+        self.assertEqual(analysis["status"], "complete")
+        self.assertEqual(analysis["clarity"], 80)
+        self.assertIn("reference_photo", analysis["tags"])
+        self.assertIn("title_block", analysis["tags"])
+        self.assertEqual(analysis["candidate_identifiers"][0]["value"], "ABC-123")
+
+    def test_semantic_image_analysis_enriches_evidence_without_creating_technical_facts(self):
+        job = {
+            "id": "job-semantic-evidence",
+            "product": "Model X",
+            "files": [
+                {
+                    "source_id": "src-image",
+                    "name": "reference.jpg",
+                    "type": "image/jpeg",
+                    "kind": "image",
+                    "sha256": "c" * 64,
+                    "stored_path": "storage/reference.jpg",
+                }
+            ],
+            "document_evidence": [],
+            "frame_analysis": [],
+            "artifacts": [],
+            "evidence_conflicts": [],
+            "image_analysis": [
+                {
+                    "analysis_key": "sem-image",
+                    "analysis_version": core.SEMANTIC_ANALYSIS_VERSION,
+                    "source_id": "src-image",
+                    "source_file": "reference.jpg",
+                    "stored_path": "storage/reference.jpg",
+                    "evidence_type": "uploaded_image",
+                    "status": "complete",
+                    "visual_summary": "A mounting bolt is visible beside the housing; label appears to show 25 N-m.",
+                    "observed_items": ["housing", "mounting bolt"],
+                    "tags": ["detail_view"],
+                    "confidence": "medium",
+                }
+            ],
+        }
+
+        core.refresh_job_evidence(job)
+        image_evidence = next(item for item in job["evidence_items"] if item["evidence_type"] == "uploaded_image")
+
+        self.assertEqual(image_evidence["summary"], job["image_analysis"][0]["visual_summary"])
+        self.assertIn("semantic_analysis_complete", image_evidence["tags"])
+        self.assertEqual(job["evidence_facts"], [])
+        self.assertIn("mounting bolt", core.supporting_visual_context(job))
+
+    def test_unresolved_document_visual_analysis_is_not_sent_to_drafting(self):
+        job = {
+            "id": "job-document-visual",
+            "product": "Model X",
+            "files": [
+                {
+                    "source_id": "src-doc",
+                    "name": "drawing.pdf",
+                    "type": "application/pdf",
+                    "kind": "pdf",
+                    "sha256": "d" * 64,
+                    "authority_level": "authoritative",
+                    "revision": "",
+                    "applicability": "",
+                }
+            ],
+            "document_evidence": [
+                {
+                    "source_id": "src-doc",
+                    "source_file": "drawing.pdf",
+                    "page_number": 1,
+                    "stored_path": "storage/page-1.jpg",
+                    "text": "Drawing notes.",
+                    "extraction_method": "embedded_text",
+                }
+            ],
+            "frame_analysis": [],
+            "artifacts": [],
+            "evidence_conflicts": [],
+            "image_analysis": [
+                {
+                    "analysis_key": "sem-doc",
+                    "analysis_version": core.SEMANTIC_ANALYSIS_VERSION,
+                    "source_id": "src-doc",
+                    "source_file": "drawing.pdf",
+                    "stored_path": "storage/page-1.jpg",
+                    "evidence_type": "document_page",
+                    "page_number": 1,
+                    "status": "complete",
+                    "visual_summary": "A technical drawing with a title block and callouts.",
+                    "observed_items": ["title block", "callouts"],
+                    "tags": ["technical_drawing"],
+                    "confidence": "medium",
+                }
+            ],
+            "evidence_applicability_resolutions": {},
+        }
+
+        core.refresh_job_evidence(job)
+        self.assertEqual(core.supporting_visual_context(job), "")
+        job["evidence_applicability_resolutions"]["src-doc"] = {
+            "status": "supporting_only",
+            "answer": "Supporting context only",
+        }
+        core.refresh_job_evidence(job)
+
+        self.assertIn("technical drawing", core.supporting_visual_context(job))
 
 
 if __name__ == "__main__":

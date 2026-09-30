@@ -135,6 +135,7 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 - Conservative source-applicability review and conflict detection for torque, dimensions, part numbers, and safety directives.
 - Adaptive video sampling, OpenCV quality scoring, and candidate selection.
 - PDF page rendering, embedded-text extraction, scanned-page OCR, and page-level evidence records using local tools.
+- Semantic descriptions and local quality/orientation metrics for uploaded still images and rendered document pages, with cached normalized previews.
 - Draft questions and assembly-oriented section/step generation.
 - Section authoring, QA checks, media correction, package building, and print preview.
 - Processing logs and visible job-stage progress.
@@ -143,7 +144,7 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 
 - Assembly vocabulary and assumptions are embedded throughout processing and UI code.
 - Drawing interpretation does not yet extract title blocks, revisions, BOM tables, or callouts; current conflict detection is text-based and intentionally conservative.
-- Uploaded still-image analysis is not yet a complete production pipeline.
+- Still-image and page analysis is implemented, but domain-specific drawing/BOM interpretation and representative-media tuning remain incomplete.
 - Multi-angle automatic alignment supports fixed offsets from shared audio and transcript words. Automatic waveform drift and visual-marker alignment are not yet implemented; manual end anchors correct drift.
 - Silent-video and weak-audio workflows need a deliberate segmentation strategy.
 - Background work uses in-process threads and is not durable across process restarts.
@@ -231,7 +232,7 @@ Extract the product boundary without changing visible Assembly Assistant behavio
 - Render PDF pages and extract embedded/OCR text. **Initial local pipeline complete; coordinate-level extraction remains.**
 - Detect drawing title blocks, revision data, BOM tables, notes, and callouts where practical.
 - Extract text and structure from common office/text formats.
-- Analyze uploaded photographs and 3D render images.
+- Analyze uploaded photographs and 3D render images. **Initial semantic analysis complete; domain tuning remains.**
 - Add source authority, revision, page, region, and conflict metadata.
 - Make document evidence available to questions, drafting, section editing, and citations.
 
@@ -315,11 +316,11 @@ Safety-critical inventions, incorrect torque/specification values, incorrect sof
 
 Complete Phase 0 and the compatibility groundwork for Phase 1 before creating another product UI.
 
-1. Add semantic analysis for uploaded still images and rendered technical pages.
-2. Freeze a representative assembly baseline set when production media is available.
-3. Capture expected steps, timing, media, and critical fields.
-4. Define the remaining draft contracts and the domain-profile interface.
-5. Wrap current behavior as the first Assembly profile without changing the user-facing workflow.
+1. Define the remaining procedure/section/step draft contracts and the domain-profile interface.
+2. Wrap current behavior as the first Assembly profile without changing the user-facing workflow.
+3. Add reviewer-facing evidence visibility to section authoring.
+4. Freeze a representative assembly baseline set when production media is available.
+5. Capture expected steps, timing, media, and critical fields.
 
 This is the safest route to reuse: prove the current product, isolate what is truly common, then build the next UX on a stable engine.
 

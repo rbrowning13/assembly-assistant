@@ -641,23 +641,32 @@
 
     function renderUploadedImages(job) {
       const images = (job.files || []).filter(file => file.kind === 'image' && !file.removed);
+      const semanticByPath = new Map((job.image_analysis || []).map(item => [item.stored_path, item]));
       if (!images.length) {
         return `<div class="empty">No uploaded images yet.</div>`;
       }
       return `<div class="frame-grid" data-scroll-key="stage-uploaded-images">
-        ${images.map(file => `
-          <div class="frame-card ${isBrowserPreviewImage(file) && file.stored_path ? 'clickable' : ''}" ${isBrowserPreviewImage(file) && file.stored_path ? `onclick="openImageZoom('${jsSingleQuoted(file.stored_path)}', '${jsSingleQuoted(file.name)}')"` : ''}>
-            ${isBrowserPreviewImage(file) && file.stored_path
-              ? `<img src="${mediaUrl(file.stored_path)}" alt="${esc(file.name)}" loading="lazy">`
+        ${images.map(file => {
+          const analysis = semanticByPath.get(file.stored_path) || file.semantic_analysis || {};
+          const tags = (analysis.tags || []).slice(0, 5);
+          const displayPath = isBrowserPreviewImage(file) ? file.stored_path : analysis.preview_path;
+          return `
+          <div class="frame-card ${displayPath ? 'clickable' : ''}" ${displayPath ? `onclick="openImageZoom('${jsSingleQuoted(displayPath)}', '${jsSingleQuoted(file.name)}')"` : ''}>
+            ${displayPath
+              ? `<img src="${mediaUrl(displayPath)}" alt="${esc(file.name)}" loading="lazy">`
               : `<div class="source-tile">${esc((file.name || '').split('.').pop() || 'image')}<br><span class="subtle">Preview unavailable</span></div>`}
             <div class="subtle">${esc(file.name)}</div>
             <div class="chip-row" style="padding:0 6px 8px">
               <span class="chip brand">image</span>
               <span class="chip">${esc(file.size || '')}</span>
-              <span class="chip">${esc(file.processing_status || 'stored')}</span>
+              <span class="chip ${analysis.status === 'complete' ? 'good' : analysis.status === 'unreadable' ? 'bad' : 'warn'}">${esc(analysis.status || file.image_status || 'stored')}</span>
+              ${analysis.clarity !== undefined ? `<span class="chip">Clarity ${esc(analysis.clarity)}</span>` : ''}
+              ${tags.map(tag => `<span class="chip">${esc(tag)}</span>`).join('')}
             </div>
+            ${analysis.visual_summary ? `<div class="subtle" style="padding:0 6px 8px">${esc(analysis.visual_summary)}</div>` : ''}
+            ${(analysis.observed_items || []).length ? `<div class="subtle" style="padding:0 6px 8px">Observed: ${esc((analysis.observed_items || []).slice(0, 5).join(', '))}</div>` : ''}
           </div>
-        `).join('')}
+        `}).join('')}
       </div>`;
     }
 
@@ -697,13 +706,19 @@
         body = renderFrameGrid(job);
       } else if (key === 'images') {
         const imageCount = (job.files || []).filter(file => file.kind === 'image' && !file.removed).length;
-        body = `<div class="stage-detail-list"><div class="chip-row"><span class="chip">${imageCount} uploaded images</span><span class="chip warn">Semantic analysis not implemented</span></div>${renderUploadedImages(job)}</div>`;
+        const analyses = (job.image_analysis || []).filter(item => item.evidence_type === 'uploaded_image');
+        const analyzed = analyses.filter(item => item.status === 'complete').length;
+        const localOnly = analyses.filter(item => item.status === 'local_only').length;
+        const unreadable = analyses.filter(item => item.status === 'unreadable').length;
+        body = `<div class="stage-detail-list"><div class="chip-row"><span class="chip">${imageCount} uploaded images</span><span class="chip ${analyzed ? 'good' : 'warn'}">${analyzed} semantically analyzed</span>${localOnly ? `<span class="chip warn">${localOnly} local only</span>` : ''}${unreadable ? `<span class="chip bad">${unreadable} unreadable</span>` : ''}</div>${renderUploadedImages(job)}</div>`;
       } else if (key === 'drawings') {
         const documents = (job.files || []).filter(file => ['pdf', 'text'].includes(file.kind) && !file.removed);
         const pages = stageArtifacts(job, 'pdf_page');
         const evidence = job.document_evidence || [];
         const evidenceSummary = job.evidence_summary || {};
         const conflicts = (job.evidence_conflicts || []).filter(item => item.status === 'open');
+        const semanticByPath = new Map((job.image_analysis || []).map(item => [item.stored_path, item]));
+        const semanticPages = (job.image_analysis || []).filter(item => item.evidence_type === 'document_page' && item.status === 'complete');
         const applicabilityReviews = new Set(
           (job.evidence_items || [])
             .filter(item => item.evidence_type === 'document_page')
@@ -716,6 +731,7 @@
           <div class="chip-row">
             <span class="chip">${documents.length} documents</span>
             <span class="chip">${pages.length} rendered pages</span>
+            <span class="chip ${semanticPages.length ? 'good' : 'warn'}">${semanticPages.length} visually analyzed</span>
             <span class="chip ${textChars ? 'good' : 'warn'}">${textChars} extracted characters</span>
             <span class="chip">${esc(evidenceSummary.fact_count || 0)} technical facts</span>
             <span class="chip ${applicabilityReviews.size ? 'warn' : 'good'}">${applicabilityReviews.size} applicability reviews</span>
@@ -724,7 +740,12 @@
           </div>
           <div class="file-list">${documents.map(file => `<div class="file-row"><div><div class="strong">${esc(file.name)}</div><div class="subtle">${esc(file.document_status || 'not processed')} · ${esc(file.document_page_count || 0)} pages · ${esc(file.authority_level || '')}${file.revision ? ' · rev ' + esc(file.revision) : ''}</div></div>${file.document_error ? `<span class="chip bad">${esc(file.document_error)}</span>` : ''}</div>`).join('') || '<div class="empty">No supporting documents attached.</div>'}</div>
           ${conflicts.length ? `<div class="file-list">${conflicts.map(conflict => `<div class="file-row"><div><div class="strong">${esc(String(conflict.fact_type || 'technical').replaceAll('_', ' '))}: ${esc(conflict.subject || 'unspecified subject')}</div><div class="subtle">${(conflict.claims || []).map(claim => `${esc(claim.source_name || 'source')}: ${esc(claim.value || '')}`).join(' · ')}</div></div><span class="chip bad">Review required</span></div>`).join('')}</div>` : ''}
-          ${pages.length ? `<div class="frame-grid">${pages.map(page => `<div class="frame-card clickable" onclick="openImageZoom('${jsSingleQuoted(page.stored_path)}', '${jsSingleQuoted((page.source_file || '') + ' page ' + (page.page_number || ''))}')"><img src="${mediaUrl(page.stored_path)}" alt="${esc(page.source_file || 'Document page')}"><div class="subtle">${esc(page.source_file || '')} · page ${esc(page.page_number || '')}<br>${esc(page.summary || '')}</div></div>`).join('')}</div>` : ''}
+          ${pages.length ? `<div class="frame-grid">${pages.map(page => {
+            const analysis = semanticByPath.get(page.stored_path) || {};
+            const document = analysis.document || {};
+            const identifiers = (analysis.candidate_identifiers || []).slice(0, 2);
+            return `<div class="frame-card clickable" onclick="openImageZoom('${jsSingleQuoted(page.stored_path)}', '${jsSingleQuoted((page.source_file || '') + ' page ' + (page.page_number || ''))}')"><img src="${mediaUrl(page.stored_path)}" alt="${esc(page.source_file || 'Document page')}"><div class="subtle">${esc(page.source_file || '')} · page ${esc(page.page_number || '')}<br>${esc(analysis.visual_summary || page.summary || '')}</div><div class="chip-row" style="padding:0 6px 8px">${document.page_type && document.page_type !== 'unknown' ? `<span class="chip brand">${esc(document.page_type)}</span>` : ''}${(analysis.tags || []).slice(0, 4).map(tag => `<span class="chip">${esc(tag)}</span>`).join('')}${identifiers.map(item => `<span class="chip warn">Candidate ${esc(item.label)}: ${esc(item.value)}</span>`).join('')}</div></div>`;
+          }).join('')}</div>` : ''}
         </div>`;
       } else if (key === 'questions') {
         body = renderQuestions(job);
@@ -1219,6 +1240,7 @@
               <button onclick="rerunJob('${job.id}')" ${processingActive ? 'disabled' : ''}>Rerun Job</button>
               <button onclick="rerunStage('${job.id}', 'transcription')" ${processingActive ? 'disabled' : ''}>Rerun Transcript</button>
               <button onclick="rerunStage('${job.id}', 'drawings')" ${processingActive ? 'disabled' : ''}>Rerun Documents</button>
+              <button onclick="rerunStage('${job.id}', 'images')" ${processingActive ? 'disabled' : ''}>Rerun Images</button>
               <button onclick="rerunStage('${job.id}', 'video')" ${processingActive ? 'disabled' : ''}>Rerun Video</button>
               <button onclick="rerunStage('${job.id}', 'draft_sections')" ${processingActive ? 'disabled' : ''}>Rerun Drafts</button>
               <button onclick="rerunStage('${job.id}', 'media_assignment')" ${processingActive || !job.draft_sections.length ? 'disabled' : ''}>Rerun Media</button>
@@ -1853,7 +1875,8 @@
 
     function mediaOptionImage(option) {
       if (option.previewable) {
-        return `<img class="media-option-preview clickable" src="${mediaUrl(option.path)}" alt="${esc(option.label || option.path)}" loading="lazy" onclick="openImageZoom('${jsSingleQuoted(option.path)}', '${jsSingleQuoted(option.label || option.path)}')">`;
+        const previewPath = option.preview_path || option.path;
+        return `<img class="media-option-preview clickable" src="${mediaUrl(previewPath)}" alt="${esc(option.label || option.path)}" loading="lazy" onclick="openImageZoom('${jsSingleQuoted(previewPath)}', '${jsSingleQuoted(option.label || option.path)}')">`;
       }
       return `<div class="source-tile">${esc(option.kind || 'media')}<br><span class="subtle">Preview unavailable</span></div>`;
     }
@@ -2015,7 +2038,7 @@
               </div>
               ${option.summary || option.reason ? `<div class="subtle">${esc(option.summary || option.reason)}</div>` : ''}
               <div class="split-actions">
-                ${option.previewable ? `<button onclick="openImageZoom('${jsSingleQuoted(option.path)}', '${jsSingleQuoted(option.label || option.path)}')">Preview</button>` : ''}
+                ${option.previewable ? `<button onclick="openImageZoom('${jsSingleQuoted(option.preview_path || option.path)}', '${jsSingleQuoted(option.label || option.path)}')">Preview</button>` : ''}
                 ${replacing ? `<button class="primary" onclick="addStepMedia('${jsSingleQuoted(option.path)}', 'replace')">Use Replacement</button>` : `
                   <button onclick="addStepMedia('${jsSingleQuoted(option.path)}', 'support')">Use as Support</button>
                   <button class="primary" onclick="addStepMedia('${jsSingleQuoted(option.path)}', 'primary')">Use as Primary</button>
@@ -3254,6 +3277,7 @@
       const supported = {
         transcription: 'transcription',
         drawings: 'drawings',
+        images: 'images',
         video: 'video',
         draft_sections: 'draft_sections'
       };

@@ -19,7 +19,7 @@ Prove and stabilize Assembly Assistant while creating a clean boundary for a reu
 - Source labels, authority, revision, and applicability metadata.
 - Real PDF rendering, embedded-text extraction, scanned-page OCR, and page-level evidence.
 - Supporting document context included in AI drafting with source-authority instructions.
-- Honest image-stage status: uploaded images are cataloged, but semantic still-image analysis remains pending.
+- Semantic visual analysis for uploaded images and rendered document pages, with local clarity/orientation metrics, cached normalized previews, and explicit local-only/unreadable states.
 - Synthetic unit and isolated API tests for source defaults, offsets, drift, transcript selection, and text evidence.
 - Temporary FFmpeg fixtures for known offsets, portrait/landscape orientation, alternate angles, voiceover, audible/visible markers, and scripted step times.
 - Processing-run manifests containing engine/profile/prompt versions, redacted configuration, source setup, stage outcomes, timing, counts, alignment evidence, and failures.
@@ -34,10 +34,10 @@ Prove and stabilize Assembly Assistant while creating a clean boundary for a reu
 
 Work that does not require production recordings:
 
-1. Add semantic analysis for uploaded still images and rendered technical pages.
-2. Define neutral procedure/section/step draft contracts and the first Assembly profile interface.
+1. Define neutral procedure/section/step draft contracts and the first Assembly profile interface.
+2. Add evidence visibility to section authoring so reviewers can inspect the source behind generated claims.
 3. Add visual sync-marker alignment as a fallback for silent or weak-audio multi-angle recordings.
-4. Add evidence visibility to section authoring so reviewers can inspect the source behind generated claims.
+4. Extend drawing interpretation from page classification into title-block, revision, BOM, and callout extraction after representative documents are available.
 
 Work that should wait for representative media:
 
