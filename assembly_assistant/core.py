@@ -72,6 +72,9 @@ LOCAL_WHISPER_BEAM_SIZE = 1
 VIDEO_FRAME_SAMPLE_RATE_HZ = 3
 VIDEO_FRAME_INTERVAL_SECONDS = 1 / VIDEO_FRAME_SAMPLE_RATE_HZ
 VIDEO_EXTRACTION_TIMEOUT_SECONDS = 1200
+DOCUMENT_TEXT_TIMEOUT_SECONDS = 180
+DOCUMENT_RENDER_TIMEOUT_SECONDS = 600
+DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS = 120
 FRAME_MANIFEST_NAME = "frame_manifest.json"
 FRAME_MANIFEST_VERSION = 2
 ADAPTIVE_BASE_SAMPLE_RATES = {
@@ -127,6 +130,21 @@ FRAME_ANALYSIS_PROFILE_BUDGETS = {
 HARD_FRAME_CUE_TAGS = {"good_image", "operator_image_cue"}
 STEP_FRAME_CUE_TAGS = {"step", "step_window", "after_action_pause", "pause"}
 SOFT_FRAME_CUE_TAGS = {"parts", "tool", "torque", "threadlocker", "quality", "safety", "fixture"}
+TIMED_SOURCE_KINDS = {"video", "audio"}
+SOURCE_ROLES = {
+    "primary_video",
+    "alternate_angle",
+    "voiceover",
+    "supporting_document",
+    "reference_image",
+    "reference",
+}
+SOURCE_AUTHORITY_LEVELS = {
+    "authoritative",
+    "primary_evidence",
+    "supporting_context",
+    "reference_only",
+}
 VIDEO_COVERAGE_INTERVAL_SECONDS = 6
 VIDEO_CUE_BURST_SECONDS = 6
 PROCESSING_WATCHDOG_SECONDS = 10 * 60
@@ -222,6 +240,179 @@ def file_kind(file):
     return "unknown"
 
 
+def optional_float(value):
+    if value in {None, ""}:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def default_source_role(kind, first_timed=False):
+    if kind == "video":
+        return "primary_video" if first_timed else "alternate_angle"
+    if kind == "audio":
+        return "voiceover"
+    if kind in {"pdf", "text"}:
+        return "supporting_document"
+    if kind == "image":
+        return "reference_image"
+    return "reference"
+
+
+def default_source_authority(kind):
+    if kind in TIMED_SOURCE_KINDS:
+        return "primary_evidence"
+    return "supporting_context"
+
+
+def normalize_timeline_sync(file):
+    raw = file.get("timeline_sync") if isinstance(file.get("timeline_sync"), dict) else {}
+    mode = str(raw.get("mode") or "auto").strip().lower()
+    if mode not in {"auto", "manual", "reference"}:
+        mode = "auto"
+    sync = {
+        "mode": mode,
+        "start_source_seconds": optional_float(raw.get("start_source_seconds")),
+        "start_timeline_seconds": optional_float(raw.get("start_timeline_seconds")),
+        "end_source_seconds": optional_float(raw.get("end_source_seconds")),
+        "end_timeline_seconds": optional_float(raw.get("end_timeline_seconds")),
+    }
+    file["timeline_sync"] = sync
+    return sync
+
+
+def manual_timeline_transform(file):
+    sync = normalize_timeline_sync(file)
+    if sync.get("mode") != "manual":
+        return None
+    source_start = sync.get("start_source_seconds")
+    timeline_start = sync.get("start_timeline_seconds")
+    if source_start is None or timeline_start is None:
+        return None
+
+    scale = 1.0
+    source_end = sync.get("end_source_seconds")
+    timeline_end = sync.get("end_timeline_seconds")
+    if source_end is not None and timeline_end is not None and source_end > source_start:
+        scale = (timeline_end - timeline_start) / (source_end - source_start)
+        if not 0.5 <= scale <= 1.5:
+            return None
+    return {
+        "mode": "manual",
+        "source_origin_seconds": source_start,
+        "timeline_origin_seconds": timeline_start,
+        "scale": scale,
+        "offset_seconds": timeline_start - source_start,
+        "has_drift_anchor": source_end is not None and timeline_end is not None,
+    }
+
+
+def source_timeline_transform(source):
+    if isinstance(source, (int, float)):
+        return {
+            "mode": "offset",
+            "source_origin_seconds": 0.0,
+            "timeline_origin_seconds": float(source),
+            "scale": 1.0,
+            "offset_seconds": float(source),
+        }
+    source = source or {}
+    if source.get("timeline_reference") or source.get("_timeline_reference"):
+        return {
+            "mode": "reference",
+            "source_origin_seconds": 0.0,
+            "timeline_origin_seconds": 0.0,
+            "scale": 1.0,
+            "offset_seconds": 0.0,
+        }
+    timeline_sync = source.get("timeline_sync") or source.get("_timeline_sync")
+    manual_source = source
+    if timeline_sync is not source.get("timeline_sync"):
+        manual_source = dict(source)
+        manual_source["timeline_sync"] = timeline_sync or {}
+    manual = manual_timeline_transform(manual_source)
+    if manual:
+        return manual
+    offset = optional_float(source.get("timeline_offset_seconds"))
+    if offset is None:
+        offset = optional_float(source.get("_timeline_offset_seconds")) or 0.0
+    scale = optional_float(source.get("timeline_scale"))
+    if scale is None:
+        scale = optional_float(source.get("_timeline_scale")) or 1.0
+    return {
+        "mode": "auto",
+        "source_origin_seconds": 0.0,
+        "timeline_origin_seconds": offset,
+        "scale": scale,
+        "offset_seconds": offset,
+    }
+
+
+def apply_source_timeline(source_seconds, source=None):
+    transform = source_timeline_transform(source)
+    source_value = float(source_seconds or 0)
+    timeline_value = transform["timeline_origin_seconds"] + (
+        source_value - transform["source_origin_seconds"]
+    ) * transform["scale"]
+    return max(0.0, timeline_value)
+
+
+def normalize_job_sources(job):
+    files = active_job_files(job)
+    timed_files = [file for file in files if file_kind(file) in TIMED_SOURCE_KINDS]
+    first_timed_id = file_identity(timed_files[0]) if timed_files else None
+
+    for file in files:
+        kind = file_kind(file)
+        file["kind"] = kind
+        file.setdefault("source_id", f"src-{uuid.uuid4().hex[:10]}")
+        role = str(file.get("source_role") or "").strip().lower()
+        if role not in SOURCE_ROLES:
+            role = default_source_role(kind, file_identity(file) == first_timed_id)
+        file["source_role"] = role
+        file.setdefault("source_label", "")
+        authority = str(file.get("authority_level") or "").strip().lower()
+        file["authority_level"] = authority if authority in SOURCE_AUTHORITY_LEVELS else default_source_authority(kind)
+        file.setdefault("revision", "")
+        file.setdefault("applicability", "")
+        normalize_timeline_sync(file)
+
+    if not timed_files:
+        return
+
+    references = [file for file in timed_files if file.get("timeline_reference")]
+    reference = references[0] if references else timed_files[0]
+    for file in timed_files:
+        file["timeline_reference"] = file is reference
+        if file is reference:
+            file["timeline_offset_seconds"] = 0.0
+            file["timeline_scale"] = 1.0
+            file["timeline_sync"]["mode"] = "reference"
+            file["timeline_alignment"] = {
+                "method": "reference_source",
+                "confidence": "reference",
+                "reference_file": file.get("name"),
+            }
+        elif file["timeline_sync"].get("mode") == "reference":
+            file["timeline_sync"]["mode"] = "auto"
+
+    narration_sources = [file for file in timed_files if file.get("use_for_drafting")]
+    narration = narration_sources[0] if narration_sources else reference
+    for file in timed_files:
+        file["use_for_drafting"] = file is narration
+
+
+def drafting_source_files(job):
+    normalize_job_sources(job)
+    return [
+        file
+        for file in active_job_files(job)
+        if file.get("kind") in TIMED_SOURCE_KINDS and file.get("use_for_drafting")
+    ]
+
+
 def human_size(byte_count):
     size = float(byte_count or 0)
     for unit in ["B", "KB", "MB", "GB"]:
@@ -302,6 +493,7 @@ def store_uploaded_files(job, uploads, source="job upload", question_id=None, cl
         if clarification_for:
             record["clarification_for"] = clarification_for
         job["files"].append(record)
+        normalize_job_sources(job)
         existing_files[digest] = record
         added.append(record)
     if added or skipped:
@@ -378,6 +570,7 @@ def store_chunked_job_upload(job, params, data):
         "processing_status": "stored",
     }
     job["files"].append(record)
+    normalize_job_sources(job)
     job["needs_processing"] = True
     if job.get("status") not in {"Processing", "Drafting Sections", "Questions Pending"}:
         job["status"] = "Needs Processing"
@@ -617,7 +810,99 @@ def remove_job_upload(job, identity):
     if removed_sha:
         removed["sha256"] = removed_sha
     mark_job_needs_processing(job, f"Removed upload from processing set: {removed_name}. Stored file retained.")
+    normalize_job_sources(job)
     return removed
+
+
+def update_job_source(job, identity, data):
+    normalize_job_sources(job)
+    target = next(
+        (
+            file
+            for file in active_job_files(job)
+            if identity in {file.get("source_id"), file_identity(file), file.get("sha256"), file.get("stored_path")}
+        ),
+        None,
+    )
+    if not target:
+        return None, "Source file not found."
+
+    kind = target.get("kind") or file_kind(target)
+    role = str(data.get("source_role") or target.get("source_role") or "").strip().lower()
+    if role not in SOURCE_ROLES:
+        return None, "Invalid source role."
+    authority = str(data.get("authority_level") or target.get("authority_level") or "").strip().lower()
+    if authority not in SOURCE_AUTHORITY_LEVELS:
+        return None, "Invalid authority level."
+    sync = None
+    transform = None
+    if kind in TIMED_SOURCE_KINDS:
+        mode = str(data.get("sync_mode") or target.get("timeline_sync", {}).get("mode") or "auto").lower()
+        if mode not in {"auto", "manual", "reference"}:
+            return None, "Invalid synchronization mode."
+        if target.get("timeline_reference") or bool(data.get("timeline_reference")):
+            mode = "reference"
+        sync = {
+            "mode": mode,
+            "start_source_seconds": optional_float(data.get("start_source_seconds")),
+            "start_timeline_seconds": optional_float(data.get("start_timeline_seconds")),
+            "end_source_seconds": optional_float(data.get("end_source_seconds")),
+            "end_timeline_seconds": optional_float(data.get("end_timeline_seconds")),
+        }
+        if mode == "manual":
+            candidate = dict(target)
+            candidate["timeline_sync"] = sync
+            transform = manual_timeline_transform(candidate)
+            if not transform:
+                return None, "Manual synchronization needs a valid start anchor and optional matching end anchors."
+
+    target["source_role"] = role
+    target["source_label"] = str(data.get("source_label") or "").strip()[:120]
+    target["authority_level"] = authority
+    target["revision"] = str(data.get("revision") or "").strip()[:120]
+    target["applicability"] = str(data.get("applicability") or "").strip()[:500]
+
+    if kind in TIMED_SOURCE_KINDS:
+        if bool(data.get("timeline_reference")):
+            for file in active_job_files(job):
+                if file.get("kind") in TIMED_SOURCE_KINDS:
+                    file["timeline_reference"] = file is target
+        if bool(data.get("use_for_drafting")):
+            for file in active_job_files(job):
+                if file.get("kind") in TIMED_SOURCE_KINDS:
+                    file["use_for_drafting"] = file is target
+        if target.get("timeline_reference"):
+            mode = "reference"
+            sync["mode"] = "reference"
+        target["timeline_sync"] = sync
+        if mode == "manual":
+            target["timeline_offset_seconds"] = round(transform["offset_seconds"], 6)
+            target["timeline_scale"] = round(transform["scale"], 9)
+            target["timeline_alignment"] = {
+                "method": "manual_anchors",
+                "confidence": "manual",
+                "reference_file": next(
+                    (
+                        file.get("name")
+                        for file in active_job_files(job)
+                        if file.get("kind") in TIMED_SOURCE_KINDS and file.get("timeline_reference")
+                    ),
+                    "",
+                ),
+                "offset_seconds": round(transform["offset_seconds"], 6),
+                "scale": round(transform["scale"], 9),
+                "has_drift_anchor": transform["has_drift_anchor"],
+            }
+        elif mode == "auto" and not target.get("timeline_reference"):
+            target["timeline_alignment"] = {
+                "method": "pending_auto_alignment",
+                "confidence": "pending",
+                "reason": "Run transcription to estimate alignment from matching timed words.",
+            }
+
+    normalize_job_sources(job)
+    mark_job_needs_processing(job, f"Updated source setup: {target.get('name')}.")
+    return target, None
 
 
 def upsert_artifact(job, record):
@@ -1270,6 +1555,7 @@ def run_upload_check(job_id):
     kinds = {}
     with STATE_LOCK:
         job = JOBS[job_id]
+        normalize_job_sources(job)
         for file in active_job_files(job):
             files_seen += 1
             kind = file_kind(file)
@@ -1304,6 +1590,8 @@ def write_transcript_file(job, media_file, audio_record=None, status="pending_pr
         "chunks": (transcription or {}).get("chunks", []),
         "timing": (transcription or {}).get("timing", {}),
         "timeline_offset_seconds": float(media_file.get("timeline_offset_seconds") or 0),
+        "timeline_scale": float(media_file.get("timeline_scale") or 1),
+        "timeline_sync": media_file.get("timeline_sync") or {},
         "timeline_alignment": media_file.get("timeline_alignment") or {},
         "raw_response": raw_response,
         "error": error,
@@ -1480,6 +1768,7 @@ def estimate_transcript_offset(reference_payload, candidate_payload):
 
 
 def align_transcript_timelines(job):
+    normalize_job_sources(job)
     sources = []
     for file in active_job_files(job):
         if file.get("transcript_status") != "complete":
@@ -1494,19 +1783,45 @@ def align_transcript_timelines(job):
     if not sources:
         return []
 
-    reference_file, reference_payload = sources[0]
+    reference_file, reference_payload = next(
+        ((file, payload) for file, payload in sources if file.get("timeline_reference")),
+        sources[0],
+    )
     reference_file["timeline_offset_seconds"] = 0
+    reference_file["timeline_scale"] = 1
+    reference_file["timeline_sync"]["mode"] = "reference"
     reference_file["timeline_alignment"] = {
-        "method": "reference_audio",
+        "method": "reference_source",
         "confidence": "reference",
         "reference_file": reference_file.get("name"),
     }
 
     alignments = []
-    for file, payload in sources[1:]:
+    for file, payload in sources:
+        if file is reference_file:
+            continue
+        manual = manual_timeline_transform(file)
+        if manual:
+            file["timeline_offset_seconds"] = round(manual["offset_seconds"], 6)
+            file["timeline_scale"] = round(manual["scale"], 9)
+            file["timeline_alignment"] = {
+                "method": "manual_anchors",
+                "reference_file": reference_file.get("name"),
+                "confidence": "manual",
+                "offset_seconds": round(manual["offset_seconds"], 6),
+                "scale": round(manual["scale"], 9),
+                "has_drift_anchor": manual["has_drift_anchor"],
+            }
+            alignments.append({
+                "source_file": file.get("name"),
+                **file["timeline_alignment"],
+                "match_count": 0,
+            })
+            continue
         estimate = estimate_transcript_offset(reference_payload, payload)
         if estimate:
             file["timeline_offset_seconds"] = estimate["offset_seconds"]
+            file["timeline_scale"] = 1
             file["timeline_alignment"] = {
                 "method": "transcript_word_match",
                 "reference_file": reference_file.get("name"),
@@ -1515,6 +1830,7 @@ def align_transcript_timelines(job):
             alignments.append({"source_file": file.get("name"), **estimate})
         else:
             file["timeline_offset_seconds"] = float(file.get("timeline_offset_seconds") or 0)
+            file["timeline_scale"] = float(file.get("timeline_scale") or 1)
             file["timeline_alignment"] = {
                 "method": "not_aligned",
                 "reference_file": reference_file.get("name"),
@@ -1541,6 +1857,7 @@ def run_transcription_stage(job_id):
 
     with STATE_LOCK:
         job = JOBS[job_id]
+        normalize_job_sources(job)
         media_files = [
             file
             for file in active_job_files(job)
@@ -1561,6 +1878,9 @@ def run_transcription_stage(job_id):
     extraction_failed = 0
     transcription_failed = 0
     pending_provider = 0
+    required_extraction_failed = 0
+    required_transcription_failed = 0
+    required_pending_provider = 0
     aligned_sources = 0
     for index, file in enumerate(media_files, start=1):
         input_path = stored_path(file)
@@ -1679,6 +1999,8 @@ def run_transcription_stage(job_id):
                         add_log(job, "Transcript provider skipped: transcription is disabled in Settings.")
                 else:
                     extraction_failed += 1
+                    if file.get("use_for_drafting"):
+                        required_extraction_failed += 1
                     file["processing_status"] = "audio extraction failed"
                     file["audio_error"] = extraction_error or (result.stderr or result.stdout or "ffmpeg failed")[-1000:]
                     add_log(job, f"Audio extraction failed for {file.get('name')}: {file['audio_error']}")
@@ -1699,11 +2021,15 @@ def run_transcription_stage(job_id):
                     audio_record["processing_status"] = file["processing_status"]
                     if error == "missing_api_key":
                         pending_provider += 1
+                        if file.get("use_for_drafting"):
+                            required_pending_provider += 1
                         if "OpenAI key missing" not in job["flags"]:
                             job["flags"].append("OpenAI key missing")
                         add_log(job, "Transcript provider skipped: OpenAI API key is not set.")
                     else:
                         transcription_failed += 1
+                        if file.get("use_for_drafting"):
+                            required_transcription_failed += 1
                         if "Transcription issue" not in job["flags"]:
                             job["flags"].append("Transcription issue")
                         add_log(job, f"Transcript provider failed for {file.get('name')}: {error}")
@@ -1713,10 +2039,17 @@ def run_transcription_stage(job_id):
         aligned_sources = len(alignments)
         if alignments:
             for alignment in alignments:
-                add_log(
-                    job,
-                    f"Timeline aligned {alignment.get('source_file')} at {alignment.get('offset_seconds')}s offset ({alignment.get('confidence')} confidence, {alignment.get('match_count')} word matches).",
-                )
+                if alignment.get("method") == "manual_anchors":
+                    drift_note = " with drift correction" if alignment.get("has_drift_anchor") else ""
+                    add_log(
+                        job,
+                        f"Timeline aligned {alignment.get('source_file')} from manual anchors at {alignment.get('offset_seconds')}s offset{drift_note}.",
+                    )
+                else:
+                    add_log(
+                        job,
+                        f"Timeline aligned {alignment.get('source_file')} at {alignment.get('offset_seconds')}s offset ({alignment.get('confidence')} confidence, {alignment.get('match_count')} word matches).",
+                    )
     with STATE_LOCK:
         job = JOBS[job_id]
         note = f"{extracted} audio files extracted"
@@ -1745,13 +2078,13 @@ def run_transcription_stage(job_id):
             "updated_at": datestamp(),
         }
         status = "done"
-        if extraction_failed or transcription_failed:
+        if required_extraction_failed or required_transcription_failed:
             status = "failed"
-        elif pending_provider:
+        elif required_pending_provider:
             status = "blocked"
-        set_stage(job, "transcription", status, 100 if not extraction_failed else 75, note)
+        set_stage(job, "transcription", status, 100 if not required_extraction_failed else 75, note)
         add_log(job, f"Transcript stage complete: {note}.")
-    return not extraction_failed and not transcription_failed and not pending_provider
+    return not required_extraction_failed and not required_transcription_failed and not required_pending_provider
 
 
 def base_stages():
@@ -1875,11 +2208,17 @@ def transcript_payload_for_file(file):
     data["_path"] = transcript_rel
     data["_source_file"] = file.get("name") or data.get("source_file")
     data["_timeline_offset_seconds"] = float(file.get("timeline_offset_seconds") or data.get("timeline_offset_seconds") or 0)
+    data["_timeline_scale"] = float(file.get("timeline_scale") or data.get("timeline_scale") or 1)
+    data["_timeline_sync"] = file.get("timeline_sync") or data.get("timeline_sync") or {}
     data["_timeline_alignment"] = file.get("timeline_alignment") or data.get("timeline_alignment") or {}
+    data["_timeline_reference"] = bool(file.get("timeline_reference"))
+    data["_use_for_drafting"] = bool(file.get("use_for_drafting"))
+    data["_source_id"] = file.get("source_id") or ""
     return data
 
 
 def transcript_payloads(job):
+    normalize_job_sources(job)
     payloads = []
     for file in active_job_files(job):
         payload = transcript_payload_for_file(file)
@@ -1888,9 +2227,14 @@ def transcript_payloads(job):
     return payloads
 
 
+def drafting_transcript_payloads(job):
+    payloads = [payload for payload in transcript_payloads(job) if payload.get("_use_for_drafting")]
+    return payloads or transcript_payloads(job)[:1]
+
+
 def transcript_text(job):
     texts = []
-    for payload in transcript_payloads(job):
+    for payload in drafting_transcript_payloads(job):
         text = (payload.get("text") or "").strip()
         if text:
             texts.append(text)
@@ -1927,8 +2271,7 @@ def timed_word_token(value):
 
 def transcript_timed_words(job):
     words = []
-    for payload in transcript_payloads(job):
-        offset = float(payload.get("_timeline_offset_seconds") or 0)
+    for payload in drafting_transcript_payloads(job):
         source_file = payload.get("_source_file") or payload.get("source_file")
         for word in payload.get("words") or []:
             if not isinstance(word, dict):
@@ -1940,8 +2283,8 @@ def transcript_timed_words(job):
             end = timed_seconds(word.get("end"), start)
             if start is None:
                 continue
-            start = max(0, start + offset)
-            end = max(start, (end if end is not None else start) + offset)
+            start = apply_source_timeline(start, payload)
+            end = max(start, apply_source_timeline(end if end is not None else start, payload))
             words.append(
                 {
                     "word": word.get("word") or word.get("text") or token,
@@ -2162,16 +2505,15 @@ def transcript_step_slices(job):
 
 def transcript_timed_segments(job, duration_seconds):
     explicit = []
-    for payload in transcript_payloads(job):
-        offset = float(payload.get("_timeline_offset_seconds") or 0)
+    for payload in drafting_transcript_payloads(job):
         source_file = payload.get("_source_file") or payload.get("source_file")
         for segment in payload.get("segments") or []:
             if not isinstance(segment, dict):
                 continue
             text = re.sub(r"\s+", " ", segment.get("text") or "").strip()
             try:
-                start = float(segment.get("start")) + offset
-                end = float(segment.get("end")) + offset
+                start = apply_source_timeline(float(segment.get("start")), payload)
+                end = apply_source_timeline(float(segment.get("end")), payload)
             except Exception:
                 continue
             if text and end > start:
@@ -2339,19 +2681,24 @@ def frame_source_timestamp_seconds(frame_path):
     return max(0, (number - 1) * VIDEO_FRAME_INTERVAL_SECONDS)
 
 
-def frame_timestamp_seconds(frame_path, timeline_offset_seconds=0):
+def frame_timestamp_seconds(frame_path, timeline_source=None):
     record = frame_manifest_record(frame_path)
     if record:
         try:
-            if record.get("timestamp_seconds") is not None:
-                return max(0, float(record.get("timestamp_seconds")))
+            source_seconds = float(record.get("source_timestamp_seconds") or 0)
+            if timeline_source is not None:
+                return apply_source_timeline(source_seconds, timeline_source)
+            return apply_source_timeline(
+                source_seconds,
+                {
+                    "timeline_offset_seconds": record.get("timeline_offset_seconds") or 0,
+                    "timeline_scale": record.get("timeline_scale") or 1,
+                    "timeline_sync": record.get("timeline_sync") or {},
+                },
+            )
         except Exception:
             pass
-        try:
-            return max(0, float(record.get("source_timestamp_seconds") or 0) + float(timeline_offset_seconds or record.get("timeline_offset_seconds") or 0))
-        except Exception:
-            pass
-    return max(0, frame_source_timestamp_seconds(frame_path) + float(timeline_offset_seconds or 0))
+    return apply_source_timeline(frame_source_timestamp_seconds(frame_path), timeline_source or 0)
 
 
 def frame_sampling_metadata(frame_path):
@@ -2391,7 +2738,7 @@ def cached_video_frames(file, frame_dir, schedule_hash=None):
     if schedule_hash:
         manifest = load_frame_manifest(expected_paths[0].parent)
         if manifest and manifest.get("schedule_hash") == schedule_hash:
-            return sorted(expected_paths, key=lambda path: frame_timestamp_seconds(path, float(file.get("timeline_offset_seconds") or 0)))
+            return sorted(expected_paths, key=lambda path: frame_timestamp_seconds(path, file))
         return []
     interval = file.get("frame_interval_seconds")
     if interval not in {None, VIDEO_FRAME_INTERVAL_SECONDS}:
@@ -2755,6 +3102,7 @@ def dedupe_frame_records(records):
 def extract_adaptive_video_frames(ffmpeg, input_path, frame_dir, file, schedule):
     remove_frame_files(frame_dir)
     timeline_offset_seconds = float(file.get("timeline_offset_seconds") or 0)
+    timeline_transform = source_timeline_transform(file)
     records = []
     window_errors = []
     next_number = 1
@@ -2784,9 +3132,11 @@ def extract_adaptive_video_frames(ffmpeg, input_path, frame_dir, file, schedule)
                 "frame_index": index,
                 "name": record["path"].name,
                 "stored_path": rel_path,
-                "timestamp_seconds": round(max(0, source_timestamp + timeline_offset_seconds), 3),
+                "timestamp_seconds": round(apply_source_timeline(source_timestamp, file), 3),
                 "source_timestamp_seconds": round(max(0, source_timestamp), 3),
                 "timeline_offset_seconds": round(timeline_offset_seconds, 3),
+                "timeline_scale": round(float(timeline_transform.get("scale") or 1), 9),
+                "timeline_sync": file.get("timeline_sync") or {},
                 "sampling_reason": record.get("sampling_reason") or "",
                 "sampling_tier": record.get("sampling_tier") or "",
                 "sample_rate_hz": record.get("sample_rate_hz"),
@@ -2818,8 +3168,8 @@ def extract_adaptive_video_frames(ffmpeg, input_path, frame_dir, file, schedule)
     return extracted_frame_files(frame_dir), stats, None
 
 
-def score_candidate_frame(frame_path, cue_times, duration_seconds, timeline_offset_seconds=0):
-    timestamp_seconds = frame_timestamp_seconds(frame_path, timeline_offset_seconds)
+def score_candidate_frame(frame_path, cue_times, duration_seconds, timeline_source=None):
+    timestamp_seconds = frame_timestamp_seconds(frame_path, timeline_source)
     sampling = frame_sampling_metadata(frame_path)
     score = 10
     tags = []
@@ -3006,15 +3356,15 @@ def apply_opencv_scoring(meta, cv_meta):
 def select_candidate_frames(job, frames, file=None):
     if not frames:
         return [], {}, {"raw_frames": 0, "selected_frames": 0, "opencv": {"enabled": cv2 is not None}}
-    timeline_offset_seconds = float((file or {}).get("timeline_offset_seconds") or 0)
+    timeline_source = file or 0
     focus_area = normalize_focus_area(job.get("focus_area"))
-    duration_seconds = max(frame_timestamp_seconds(frame, timeline_offset_seconds) for frame in frames)
+    duration_seconds = max(frame_timestamp_seconds(frame, timeline_source) for frame in frames)
     cue_times = transcript_cue_times(job, duration_seconds)
     cv_metrics, cv_stats = opencv_frame_metrics(frames, focus_area)
     scored = [
         (
             apply_opencv_scoring(
-                score_candidate_frame(frame, cue_times, duration_seconds, timeline_offset_seconds),
+                score_candidate_frame(frame, cue_times, duration_seconds, timeline_source),
                 cv_metrics.get(frame.name),
             ),
             frame,
@@ -3031,7 +3381,7 @@ def select_candidate_frames(job, frames, file=None):
         selection_sources.setdefault(frame, set()).add(source)
 
     for meta, frame in scored:
-        timestamp_seconds = frame_timestamp_seconds(frame, timeline_offset_seconds)
+        timestamp_seconds = frame_timestamp_seconds(frame, timeline_source)
         tags = set(meta.get("tags") or [])
         hard_cue = bool(tags & HARD_FRAME_CUE_TAGS)
         step_cue = bool(tags & STEP_FRAME_CUE_TAGS)
@@ -3103,7 +3453,7 @@ def select_candidate_frames(job, frames, file=None):
         meta["tags"] = sorted(tags)
         meta["selection_sources"] = sources
 
-    ordered_frames = sorted(selected, key=lambda frame: frame_timestamp_seconds(frame, timeline_offset_seconds))
+    ordered_frames = sorted(selected, key=lambda frame: frame_timestamp_seconds(frame, timeline_source))
     meta_by_name = {frame.name: selected[frame] for frame in ordered_frames}
     source_counts = {}
     for frame in ordered_frames:
@@ -3398,8 +3748,9 @@ def video_frame_record(job, file, frame_path, meta=None, source="sampled video f
     match = FRAME_FILE_RE.match(frame_path.name)
     frame_index = int(match.group(1)) if match else 1
     timeline_offset_seconds = float(file.get("timeline_offset_seconds") or 0)
+    timeline_transform = source_timeline_transform(file)
     source_timestamp_seconds = frame_source_timestamp_seconds(frame_path)
-    timestamp_seconds = frame_timestamp_seconds(frame_path, timeline_offset_seconds)
+    timestamp_seconds = frame_timestamp_seconds(frame_path, file)
     sampling = frame_sampling_metadata(frame_path)
     stored = str(frame_path.relative_to(APP_DIR))
     record = {
@@ -3416,6 +3767,9 @@ def video_frame_record(job, file, frame_path, meta=None, source="sampled video f
         "timestamp_seconds": round(timestamp_seconds, 2),
         "source_timestamp_seconds": round(source_timestamp_seconds, 2),
         "timeline_offset_seconds": round(timeline_offset_seconds, 2),
+        "timeline_scale": round(float(timeline_transform.get("scale") or 1), 9),
+        "source_id": file.get("source_id") or "",
+        "source_label": file.get("source_label") or "",
         "local_priority": meta.get("score", 0),
         "candidate_tags": meta.get("tags", []),
         "candidate_reason": meta.get("reason", ""),
@@ -3955,6 +4309,7 @@ def make_job(name, product, work_area, station, profile="Standard", files=None, 
         "stages": base_stages(),
         "questions": [],
         "question_review": {},
+        "document_evidence": [],
         "transcript_step_slices": [],
         "step_parse": {},
         "draft_sections": [],
@@ -3963,6 +4318,7 @@ def make_job(name, product, work_area, station, profile="Standard", files=None, 
         "last_activity": timestamp(),
     }
     JOBS[job_id] = job
+    normalize_job_sources(job)
     add_log(job, "Job created.")
     return job
 
@@ -3981,6 +4337,7 @@ def migrate_job_defaults(job):
     job.setdefault("draft_source", "")
     job.setdefault("frame_analysis", [])
     job.setdefault("question_review", {})
+    job.setdefault("document_evidence", [])
     job.setdefault("draft_validation", {})
     job.setdefault("draft_audit", {})
     job.setdefault("processing_cache", {})
@@ -3990,6 +4347,7 @@ def migrate_job_defaults(job):
     job.setdefault("focus_area", "center")
     job.setdefault("transcript_step_slices", [])
     job.setdefault("step_parse", {})
+    normalize_job_sources(job)
     if (
         job.get("processing_started")
         and not active_job_files(job)
@@ -4309,6 +4667,7 @@ def openai_draft_sections_for(job):
     frames = [frame.get("stored_path") for frame in frame_artifacts(job)]
     rough_steps = transcript_step_slices(job)
     expected_count = expected_step_count_for(job)
+    supporting_context = document_context(job)
     transcript_excerpt = text[:12000]
     if len(text) > len(transcript_excerpt):
         transcript_excerpt += "\n\n[Transcript truncated for prompt; rough timestamped steps above are primary.]"
@@ -4338,6 +4697,9 @@ Return JSON only, with this exact shape:
 
 Rules:
 - Do not invent drawings, frame names, torque values, tools, parts, or safety risks.
+- Use supporting-document facts only when the quoted evidence applies to this product/configuration.
+- Prefer authoritative sources over supporting context. Surface contradictions instead of silently choosing one.
+- Do not invent technical values when a document is absent, unreadable, revision-unknown, or ambiguous.
 - Use only these frame paths in media: {json.dumps(frames[:160])}
 - Prefer clear, concrete, shop-floor wording.
 - Rewrite rough operator narration into professional, direct operator language. Do not copy filler words.
@@ -4364,6 +4726,9 @@ Rough transcript steps with timestamps:
 
 Transcript excerpt:
 {transcript_excerpt}
+
+Supporting document evidence:
+{supporting_context or "None processed"}
 """
     data, error = call_openai_json(prompt)
     if error:
@@ -5142,9 +5507,10 @@ def raw_video_frame_sources(job):
                 {
                     "file": file,
                     "path": frame_path,
-                    "timestamp_seconds": frame_timestamp_seconds(frame_path, timeline_offset_seconds),
+                    "timestamp_seconds": frame_timestamp_seconds(frame_path, file),
                     "source_timestamp_seconds": frame_source_timestamp_seconds(frame_path),
                     "timeline_offset_seconds": timeline_offset_seconds,
+                    "timeline_source": file,
                     "sampling_reason": sampling.get("sampling_reason") or "",
                     "sampling_tier": sampling.get("sampling_tier") or "",
                     "sample_rate_hz": sampling.get("sample_rate_hz"),
@@ -5243,7 +5609,7 @@ def supplemental_step_frame_candidates(job, sections):
             ranked = []
             for source in in_window:
                 meta = apply_opencv_scoring(
-                    score_candidate_frame(source["path"], cue_times, duration, source.get("timeline_offset_seconds") or 0),
+                    score_candidate_frame(source["path"], cue_times, duration, source.get("timeline_source") or source.get("timeline_offset_seconds") or 0),
                     cv_metrics.get(source["path"].name),
                 )
                 delta = abs(source["timestamp_seconds"] - target_time)
@@ -5371,6 +5737,286 @@ def analyze_supplemental_step_frames(job_id, sections):
     }
 
 
+def replace_document_evidence(job, source_id, records):
+    job["document_evidence"] = [
+        record
+        for record in job.get("document_evidence", [])
+        if record.get("source_id") != source_id
+    ] + records
+
+
+def clear_document_artifacts(job, source_file):
+    job["artifacts"] = [
+        artifact
+        for artifact in job.get("artifacts", [])
+        if not (
+            artifact.get("source_file") == source_file
+            and artifact.get("kind") in {"drawing", "drawing_page", "pdf_page", "document_text"}
+        )
+    ]
+
+
+def document_evidence_record(file, page_number, text, stored_path="", extraction_method=""):
+    return {
+        "evidence_id": short_id("evidence"),
+        "source_id": file.get("source_id") or "",
+        "source_file": file.get("name") or "",
+        "source_role": file.get("source_role") or "supporting_document",
+        "authority_level": file.get("authority_level") or "supporting_context",
+        "revision": file.get("revision") or "",
+        "applicability": file.get("applicability") or "",
+        "page_number": page_number,
+        "text": re.sub(r"[ \t]+", " ", text or "").strip(),
+        "stored_path": stored_path,
+        "extraction_method": extraction_method,
+    }
+
+
+def process_text_document(job, file, path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as exc:
+        return [], f"text read failed: {exc}"
+    record = document_evidence_record(file, 1, text, extraction_method="text_file")
+    output_dir = ensure_job_dirs(job)["ocr"] / (file.get("sha256") or file.get("source_id") or "text")[:12]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "document.json"
+    output_path.write_text(json.dumps({"source_file": file.get("name"), "pages": [record]}, indent=2), encoding="utf-8")
+    file["ocr_path"] = str(output_path.relative_to(APP_DIR))
+    file["document_status"] = "text extracted"
+    file["document_page_count"] = 1
+    file["document_text_chars"] = len(text)
+    return [record], None
+
+
+def process_pdf_document(job, file, path):
+    pdftotext = shutil.which("pdftotext")
+    pdftoppm = shutil.which("pdftoppm")
+    tesseract = shutil.which("tesseract")
+    if not pdftotext and not pdftoppm:
+        return [], "PDF tools unavailable: install Poppler for text extraction and page rendering."
+
+    source_key = (file.get("sha256") or file.get("source_id") or "pdf")[:12]
+    output_dir = ensure_job_dirs(job)["ocr"] / source_key
+    output_dir.mkdir(parents=True, exist_ok=True)
+    text_path = output_dir / "document.txt"
+    pages_text = []
+    warnings = []
+
+    if pdftotext:
+        try:
+            result = subprocess.run(
+                [pdftotext, "-layout", str(path), str(text_path)],
+                capture_output=True,
+                text=True,
+                timeout=DOCUMENT_TEXT_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0 and text_path.exists():
+                pages_text = text_path.read_text(encoding="utf-8", errors="replace").split("\f")
+                while pages_text and not pages_text[-1].strip():
+                    pages_text.pop()
+            else:
+                warnings.append((result.stderr or result.stdout or "pdftotext failed")[-500:])
+        except subprocess.TimeoutExpired:
+            warnings.append("PDF text extraction timed out.")
+
+    page_paths = []
+    if pdftoppm:
+        for stale in output_dir.glob("page-*.jpg"):
+            stale.unlink(missing_ok=True)
+        try:
+            result = subprocess.run(
+                [pdftoppm, "-jpeg", "-r", "144", str(path), str(output_dir / "page")],
+                capture_output=True,
+                text=True,
+                timeout=DOCUMENT_RENDER_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                page_paths = sorted(
+                    output_dir.glob("page-*.jpg"),
+                    key=lambda item: int(re.search(r"(\d+)$", item.stem).group(1)) if re.search(r"(\d+)$", item.stem) else 0,
+                )
+            else:
+                warnings.append((result.stderr or result.stdout or "PDF page rendering failed")[-500:])
+        except subprocess.TimeoutExpired:
+            warnings.append("PDF page rendering timed out.")
+
+    page_count = max(len(pages_text), len(page_paths))
+    records = []
+    for index in range(page_count):
+        page_text = pages_text[index].strip() if index < len(pages_text) else ""
+        page_path = page_paths[index] if index < len(page_paths) else None
+        method = "embedded_text" if page_text else ""
+        if not page_text and page_path and tesseract:
+            try:
+                result = subprocess.run(
+                    [tesseract, str(page_path), "stdout", "-l", "eng"],
+                    capture_output=True,
+                    text=True,
+                    timeout=DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS,
+                )
+                if result.returncode == 0:
+                    page_text = (result.stdout or "").strip()
+                    method = "tesseract_ocr"
+                else:
+                    warnings.append(f"OCR page {index + 1} failed: {(result.stderr or '')[-300:]}")
+            except subprocess.TimeoutExpired:
+                warnings.append(f"OCR page {index + 1} timed out.")
+        stored_page = str(page_path.relative_to(APP_DIR)) if page_path else ""
+        records.append(document_evidence_record(file, index + 1, page_text, stored_page, method or "render_only"))
+
+    payload_path = output_dir / "document.json"
+    payload = {
+        "source_id": file.get("source_id") or "",
+        "source_file": file.get("name") or "",
+        "authority_level": file.get("authority_level") or "supporting_context",
+        "revision": file.get("revision") or "",
+        "applicability": file.get("applicability") or "",
+        "pages": records,
+        "warnings": warnings,
+        "processed_at": datestamp(),
+    }
+    payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    file["ocr_path"] = str(payload_path.relative_to(APP_DIR))
+    file["document_status"] = "processed" if records else "processing failed"
+    file["document_page_count"] = len(records)
+    file["document_text_chars"] = sum(len(record.get("text") or "") for record in records)
+    file["document_warnings"] = warnings[-10:]
+    if not records:
+        return [], "; ".join(warnings) or "No PDF pages or text could be extracted."
+    return records, None
+
+
+def document_context(job, max_chars=7000):
+    blocks = []
+    used = 0
+    authority_order = {"authoritative": 0, "primary_evidence": 1, "supporting_context": 2, "reference_only": 3}
+    evidence_records = sorted(
+        job.get("document_evidence", []),
+        key=lambda item: (
+            authority_order.get(item.get("authority_level"), 4),
+            item.get("source_file") or "",
+            int(item.get("page_number") or 0),
+        ),
+    )
+    for evidence in evidence_records:
+        text = (evidence.get("text") or "").strip()
+        if not text:
+            continue
+        heading = (
+            f"Source: {evidence.get('source_file') or 'document'}"
+            f" | authority: {evidence.get('authority_level') or 'supporting_context'}"
+            f" | revision: {evidence.get('revision') or 'not provided'}"
+            f" | page: {evidence.get('page_number') or 1}"
+        )
+        remaining = max_chars - used - len(heading) - 2
+        if remaining <= 0:
+            break
+        block = f"{heading}\n{text[:remaining]}"
+        blocks.append(block)
+        used += len(block) + 2
+    return "\n\n".join(blocks)
+
+
+def run_document_stage(job_id):
+    with STATE_LOCK:
+        job = JOBS[job_id]
+        normalize_job_sources(job)
+        set_stage(job, "drawings", "running", 5, "Extracting document evidence")
+        job["status"] = "Processing"
+        add_log(job, "Document processing started.")
+        sources = [
+            file
+            for file in active_job_files(job)
+            if file.get("kind") in {"pdf", "text"} and stored_path(file)
+        ]
+
+    if not sources:
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            set_stage(job, "drawings", "done", 100, "No PDF or text documents attached")
+            add_log(job, "Document processing complete: no PDF or text documents attached.")
+        return True
+
+    processed = 0
+    failed = 0
+    page_count = 0
+    text_chars = 0
+    for index, file in enumerate(sources, start=1):
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            percent = 8 + round((index - 1) / max(1, len(sources)) * 82)
+            set_stage(job, "drawings", "running", percent, f"Processing document {index}/{len(sources)}")
+            clear_document_artifacts(job, file.get("name"))
+        path = stored_path(file)
+        if file.get("kind") == "pdf":
+            records, error = process_pdf_document(job, file, path)
+        else:
+            records, error = process_text_document(job, file, path)
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            replace_document_evidence(job, file.get("source_id") or "", records)
+            for record in records:
+                if record.get("stored_path"):
+                    page_path = APP_DIR / record["stored_path"]
+                    upsert_artifact(
+                        job,
+                        {
+                            "name": page_path.name,
+                            "type": "image/jpeg",
+                            "kind": "pdf_page",
+                            "size": human_size(page_path.stat().st_size) if page_path.exists() else "",
+                            "bytes": page_path.stat().st_size if page_path.exists() else 0,
+                            "stored_path": record["stored_path"],
+                            "source": "rendered document page",
+                            "source_file": file.get("name"),
+                            "source_id": file.get("source_id") or "",
+                            "page_number": record.get("page_number"),
+                            "authority_level": file.get("authority_level"),
+                            "revision": file.get("revision"),
+                            "applicability": file.get("applicability"),
+                            "processing_status": record.get("extraction_method") or "rendered",
+                            "summary": (record.get("text") or "")[:240],
+                        },
+                    )
+            if error:
+                failed += 1
+                file["document_status"] = "processing failed"
+                file["document_error"] = error
+                add_log(job, f"Document processing failed for {file.get('name')}: {error}")
+            else:
+                processed += 1
+                page_count += len(records)
+                text_chars += sum(len(record.get("text") or "") for record in records)
+                add_log(job, f"Document processed: {file.get('name')} · {len(records)} pages · {file.get('document_text_chars', 0)} text characters.")
+
+    with STATE_LOCK:
+        job = JOBS[job_id]
+        note = f"{processed} documents · {page_count} pages · {text_chars} text characters"
+        if failed:
+            note += f" · {failed} failed"
+            if "Document processing issue" not in job["flags"]:
+                job["flags"].append("Document processing issue")
+        set_stage(job, "drawings", "failed" if failed and not processed else "done", 100 if processed else 70, note)
+        add_log(job, f"Document processing complete: {note}.")
+    return True
+
+
+def run_image_inventory_stage(job_id):
+    with STATE_LOCK:
+        job = JOBS[job_id]
+        set_stage(job, "images", "running", 20, "Cataloging uploaded images")
+        images = [file for file in active_job_files(job) if file.get("kind") == "image" and stored_path(file)]
+        for file in images:
+            file["image_status"] = "available for manual evidence selection"
+        note = f"{len(images)} uploaded images cataloged"
+        if images:
+            note += " · semantic image analysis pending"
+        set_stage(job, "images", "done", 100, note)
+        add_log(job, f"Image inventory complete: {note}.")
+    return True
+
+
 def run_stage(job_id, key, note, seconds):
     steps = max(3, int(seconds * 2))
     with STATE_LOCK:
@@ -5393,11 +6039,7 @@ def run_stage(job_id, key, note, seconds):
 
 
 def transcript_is_ready_for_drafting(job):
-    media_files = [
-        file
-        for file in active_job_files(job)
-        if file.get("kind") in {"video", "audio"} and file.get("readable")
-    ]
+    media_files = [file for file in drafting_source_files(job) if file.get("readable")]
     if not media_files:
         return True
     if not SETTINGS.get("transcription_enabled", True):
@@ -5464,6 +6106,8 @@ def run_video_stage(job_id):
                         "schedule_hash": schedule.get("hash"),
                         "source_sha256": file.get("sha256") or "",
                         "timeline_offset_seconds": file.get("timeline_offset_seconds") or 0,
+                        "timeline_scale": file.get("timeline_scale") or 1,
+                        "timeline_sync": file.get("timeline_sync") or {},
                     },
                     sort_keys=True,
                 ).encode("utf-8")
@@ -5991,13 +6635,10 @@ def process_job(job_id):
     if not run_upload_check(job_id):
         return
     transcription_ready = run_transcription_stage(job_id)
-    stages = [
-        ("drawings", "Reading PDFs, OCR text, title blocks, and BOM-like tables.", 2.2),
-        ("images", "Scoring still images for clarity and build context.", 1.8),
-    ]
-    for key, note, seconds in stages:
-        if not run_stage(job_id, key, note, seconds):
-            return
+    if not run_document_stage(job_id):
+        return
+    if not run_image_inventory_stage(job_id):
+        return
     if not run_video_stage(job_id):
         return
 
@@ -6089,6 +6730,17 @@ def rerun_stage_worker(job_id, stage_key):
                 job["flags"].append("Draft may need rerun")
             add_log(job, "Transcription rerun complete. Rerun Drafts if transcript content changed.")
         return
+    if stage_key == "drawings":
+        with STATE_LOCK:
+            reset_stages_from(JOBS[job_id], "drawings")
+        run_document_stage(job_id)
+        with STATE_LOCK:
+            job = JOBS[job_id]
+            job["status"] = "Needs Attention"
+            if "Draft may need rerun" not in job["flags"]:
+                job["flags"].append("Draft may need rerun")
+            add_log(job, "Document rerun complete. Rerun Drafts if supporting evidence changed.")
+        return
     if stage_key == "video":
         with STATE_LOCK:
             job = JOBS[job_id]
@@ -6122,7 +6774,7 @@ def rerun_stage_worker(job_id, stage_key):
 
 
 def rerun_job_stage(job_id, stage_key):
-    allowed = {"transcription", "video", "draft_sections", "media_assignment"}
+    allowed = {"transcription", "drawings", "video", "draft_sections", "media_assignment"}
     if stage_key not in allowed:
         return False
     with STATE_LOCK:
@@ -6796,6 +7448,7 @@ def job_summary(job):
 
 
 def transcript_results(job):
+    normalize_job_sources(job)
     results = []
     for file in active_job_files(job):
         transcript_rel = file.get("transcript_path")
@@ -6813,7 +7466,14 @@ def transcript_results(job):
             "chunks": [],
             "timing": {},
             "timeline_offset_seconds": float(file.get("timeline_offset_seconds") or 0),
+            "timeline_scale": float(file.get("timeline_scale") or 1),
+            "timeline_sync": file.get("timeline_sync") or {},
             "timeline_alignment": file.get("timeline_alignment") or {},
+            "source_id": file.get("source_id") or "",
+            "source_role": file.get("source_role") or "",
+            "source_label": file.get("source_label") or "",
+            "use_for_drafting": bool(file.get("use_for_drafting")),
+            "timeline_reference": bool(file.get("timeline_reference")),
         }
         if transcript_file.exists():
             try:
@@ -6828,6 +7488,8 @@ def transcript_results(job):
                         "chunks": data.get("chunks") or [],
                         "timing": data.get("timing") or {},
                         "timeline_offset_seconds": float(file.get("timeline_offset_seconds") or data.get("timeline_offset_seconds") or 0),
+                        "timeline_scale": float(file.get("timeline_scale") or data.get("timeline_scale") or 1),
+                        "timeline_sync": file.get("timeline_sync") or data.get("timeline_sync") or {},
                         "timeline_alignment": file.get("timeline_alignment") or data.get("timeline_alignment") or {},
                         "note": data.get("note") or "",
                     }
@@ -6993,6 +7655,7 @@ def create_app():
             job = JOBS.get(job_id)
             if not job or job.get("deleted"):
                 return json_response({"error": "Job not found"}, 404)
+            normalize_job_sources(job)
             payload = dict(job)
             payload["questions_pending"] = len(unresolved_questions(job))
             payload["processing_started"] = has_processing_run(job)
@@ -7199,6 +7862,21 @@ def create_app():
                 return json_response({"error": "Job not found"}, 404)
         ok = rerun_job_stage(job_id, stage_key)
         return json_response({"ok": ok})
+
+    @app.post("/api/jobs/<job_id>/source")
+    def api_job_source(job_id):
+        data = request_json()
+        identity = data.get("identity") or data.get("source_id") or ""
+        with STATE_LOCK:
+            job = JOBS.get(job_id)
+            if not job or job.get("deleted"):
+                return json_response({"error": "Job not found"}, 404)
+            if job_id in RUNNING_THREADS and RUNNING_THREADS[job_id].is_alive():
+                return json_response({"error": "Source setup cannot change while processing is running."}, 409)
+            source, error = update_job_source(job, identity, data)
+            if error:
+                return json_response({"error": error}, 400)
+            return json_response({"ok": True, "source": source})
 
     @app.post("/api/jobs/<job_id>/<action>")
     def api_job_action(job_id, action):

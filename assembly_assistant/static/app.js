@@ -42,6 +42,7 @@
       sectionQaFocus: null,
       currentPackageData: null,
       advancedOpenJobs: {},
+      sourceSetupOpen: {},
       expandedPackageSections: {},
       scrollPositions: {},
       selectedChoices: {},
@@ -696,10 +697,22 @@
         body = renderFrameGrid(job);
       } else if (key === 'images') {
         const imageCount = (job.files || []).filter(file => file.kind === 'image' && !file.removed).length;
-        body = `<div class="stage-detail-list"><span class="chip">${imageCount} uploaded images</span>${renderUploadedImages(job)}</div>`;
+        body = `<div class="stage-detail-list"><div class="chip-row"><span class="chip">${imageCount} uploaded images</span><span class="chip warn">Semantic analysis not implemented</span></div>${renderUploadedImages(job)}</div>`;
       } else if (key === 'drawings') {
-        const drawingCount = (job.files || []).filter(file => file.kind === 'pdf' && !file.removed).length;
-        body = `<div class="stage-detail-list"><span class="chip">${drawingCount} PDF drawings</span><div class="subtle">Drawing OCR and BOM extraction are still pending implementation.</div></div>`;
+        const documents = (job.files || []).filter(file => ['pdf', 'text'].includes(file.kind) && !file.removed);
+        const pages = stageArtifacts(job, 'pdf_page');
+        const evidence = job.document_evidence || [];
+        const textChars = evidence.reduce((sum, item) => sum + String(item.text || '').length, 0);
+        body = `<div class="stage-detail-list">
+          <div class="chip-row">
+            <span class="chip">${documents.length} documents</span>
+            <span class="chip">${pages.length} rendered pages</span>
+            <span class="chip ${textChars ? 'good' : 'warn'}">${textChars} extracted characters</span>
+            <span class="chip warn">BOM/title-block interpretation not implemented</span>
+          </div>
+          <div class="file-list">${documents.map(file => `<div class="file-row"><div><div class="strong">${esc(file.name)}</div><div class="subtle">${esc(file.document_status || 'not processed')} · ${esc(file.document_page_count || 0)} pages · ${esc(file.authority_level || '')}${file.revision ? ' · rev ' + esc(file.revision) : ''}</div></div>${file.document_error ? `<span class="chip bad">${esc(file.document_error)}</span>` : ''}</div>`).join('') || '<div class="empty">No supporting documents attached.</div>'}</div>
+          ${pages.length ? `<div class="frame-grid">${pages.map(page => `<div class="frame-card clickable" onclick="openImageZoom('${jsSingleQuoted(page.stored_path)}', '${jsSingleQuoted((page.source_file || '') + ' page ' + (page.page_number || ''))}')"><img src="${mediaUrl(page.stored_path)}" alt="${esc(page.source_file || 'Document page')}"><div class="subtle">${esc(page.source_file || '')} · page ${esc(page.page_number || '')}<br>${esc(page.summary || '')}</div></div>`).join('')}</div>` : ''}
+        </div>`;
       } else if (key === 'questions') {
         body = renderQuestions(job);
       } else if (key === 'draft_sections') {
@@ -874,29 +887,114 @@
       </div>`;
     }
 
+    function optionList(options, selected) {
+      return options.map(([value, label]) => `<option value="${esc(value)}" ${value === selected ? 'selected' : ''}>${esc(label)}</option>`).join('');
+    }
+
+    function sourceRoleOptions(file) {
+      if (file.kind === 'video') {
+        return [['primary_video', 'Primary video'], ['alternate_angle', 'Alternate angle']];
+      }
+      if (file.kind === 'audio') {
+        return [['voiceover', 'Voiceover / narration']];
+      }
+      if (file.kind === 'image') {
+        return [['reference_image', 'Reference image'], ['supporting_document', 'Supporting document']];
+      }
+      if (['pdf', 'text'].includes(file.kind)) {
+        return [['supporting_document', 'Supporting document'], ['reference', 'Reference only']];
+      }
+      return [['reference', 'Reference only'], ['supporting_document', 'Supporting document']];
+    }
+
+    function sourceAuthorityOptions() {
+      return [
+        ['authoritative', 'Authoritative'],
+        ['primary_evidence', 'Primary evidence'],
+        ['supporting_context', 'Supporting context'],
+        ['reference_only', 'Reference only']
+      ];
+    }
+
+    function sourceSetupId(file) {
+      return String(file.source_id || uploadIdentity(file) || '').replace(/[^A-Za-z0-9_-]+/g, '_');
+    }
+
+    function sourceAlignmentSummary(file) {
+      const alignment = file.timeline_alignment || {};
+      if (file.timeline_reference) return 'Reference timeline';
+      if (alignment.method === 'manual_anchors') {
+        const drift = alignment.has_drift_anchor ? ` · drift scale ${Number(alignment.scale || 1).toFixed(6)}` : '';
+        return `Manual · ${Number(alignment.offset_seconds || 0).toFixed(2)}s offset${drift}`;
+      }
+      if (alignment.method === 'transcript_word_match') {
+        return `Auto · ${Number(alignment.offset_seconds || 0).toFixed(2)}s offset · ${esc(alignment.confidence || 'unknown')}`;
+      }
+      return alignment.reason || 'Alignment will be calculated during transcription.';
+    }
+
+    function renderSourceSetup(job, file) {
+      const domId = sourceSetupId(file);
+      const timed = ['video', 'audio'].includes(file.kind);
+      const sync = file.timeline_sync || {};
+      const openKey = `${job.id}:${file.source_id || uploadIdentity(file)}`;
+      const isOpen = !!state.sourceSetupOpen[openKey];
+      return `<details class="source-setup" ${isOpen ? 'open' : ''} ontoggle="state.sourceSetupOpen['${jsSingleQuoted(openKey)}']=this.open">
+        <summary>Source setup</summary>
+        <div class="source-setup-grid">
+          <div class="field"><label>Role</label><select id="source-role-${domId}">${optionList(sourceRoleOptions(file), file.source_role)}</select></div>
+          <div class="field"><label>Label / camera</label><input id="source-label-${domId}" value="${esc(file.source_label || '')}" placeholder="Overhead, left side, clean voiceover"></div>
+          <div class="field"><label>Authority</label><select id="source-authority-${domId}">${optionList(sourceAuthorityOptions(), file.authority_level)}</select></div>
+          <div class="field"><label>Revision</label><input id="source-revision-${domId}" value="${esc(file.revision || '')}" placeholder="Optional"></div>
+          <div class="field source-applicability"><label>Applicability</label><input id="source-applicability-${domId}" value="${esc(file.applicability || '')}" placeholder="Model, serial range, configuration, or purpose"></div>
+        </div>
+        ${timed ? `<div class="source-timeline">
+          <label class="source-choice"><input id="source-narration-${domId}" type="radio" name="source-narration-${job.id}" ${file.use_for_drafting ? 'checked' : ''}> Use this source for instruction narration</label>
+          <label class="source-choice"><input id="source-reference-${domId}" type="radio" name="source-reference-${job.id}" ${file.timeline_reference ? 'checked' : ''}> Use as reference timeline</label>
+          <div class="subtle source-alignment-summary">${sourceAlignmentSummary(file)}</div>
+          <div class="source-sync-grid">
+            <div class="field"><label>Sync method</label><select id="source-sync-mode-${domId}" ${file.timeline_reference ? 'disabled' : ''} onchange="toggleSourceSyncFields('${domId}')">
+              <option value="reference" ${file.timeline_reference ? 'selected' : ''}>Reference</option>
+              <option value="auto" ${!file.timeline_reference && sync.mode !== 'manual' ? 'selected' : ''}>Automatic</option>
+              <option value="manual" ${!file.timeline_reference && sync.mode === 'manual' ? 'selected' : ''}>Manual anchors</option>
+            </select></div>
+            <div class="field source-manual-field source-manual-${domId} ${sync.mode === 'manual' && !file.timeline_reference ? '' : 'hidden'}"><label>Start: source seconds</label><input id="source-start-source-${domId}" type="number" step="0.01" value="${esc(sync.start_source_seconds ?? '')}"></div>
+            <div class="field source-manual-field source-manual-${domId} ${sync.mode === 'manual' && !file.timeline_reference ? '' : 'hidden'}"><label>Start: timeline seconds</label><input id="source-start-timeline-${domId}" type="number" step="0.01" value="${esc(sync.start_timeline_seconds ?? '')}"></div>
+            <div class="field source-manual-field source-manual-${domId} ${sync.mode === 'manual' && !file.timeline_reference ? '' : 'hidden'}"><label>End: source seconds</label><input id="source-end-source-${domId}" type="number" step="0.01" value="${esc(sync.end_source_seconds ?? '')}" placeholder="Optional drift anchor"></div>
+            <div class="field source-manual-field source-manual-${domId} ${sync.mode === 'manual' && !file.timeline_reference ? '' : 'hidden'}"><label>End: timeline seconds</label><input id="source-end-timeline-${domId}" type="number" step="0.01" value="${esc(sync.end_timeline_seconds ?? '')}" placeholder="Optional drift anchor"></div>
+          </div>
+        </div>` : ''}
+        <div class="split-actions source-setup-actions">
+          <button onclick="saveSourceSetup('${job.id}', '${jsSingleQuoted(file.source_id || uploadIdentity(file))}', '${domId}')">Save Setup</button>
+          <button class="danger" onclick="removeUpload('${job.id}', '${jsSingleQuoted(uploadIdentity(file))}')">Remove</button>
+        </div>
+      </details>`;
+    }
+
     function renderUploadedSources(job) {
       const files = (job.files || []).filter(file => !file.removed);
       if (!files.length) {
         return `<div class="empty">No uploaded sources yet.</div>`;
       }
-      return `<div class="file-list">
+      return `<div class="file-list source-file-list">
         ${files.map(file => `
-          <div class="file-row">
-            <div>
+          <div class="file-row source-file-row">
+            <div class="source-file-summary">
               <div class="strong">${esc(file.name)}</div>
               <div class="subtle">${esc(file.type || 'unknown')} · ${esc(file.size || '')}</div>
-              ${file.stored_path ? `<div class="subtle">${esc(file.stored_path)}</div>` : ''}
+              <div class="chip-row">
+                ${file.kind ? `<span class="chip brand">${esc(file.kind)}</span>` : ''}
+                ${file.source_role ? `<span class="chip">${esc(file.source_role.replaceAll('_', ' '))}</span>` : ''}
+                ${file.source_label ? `<span class="chip">${esc(file.source_label)}</span>` : ''}
+                ${file.use_for_drafting ? '<span class="chip good">Narration</span>' : ''}
+                ${file.timeline_reference ? '<span class="chip good">Reference timeline</span>' : ''}
+                ${file.authority_level ? `<span class="chip">${esc(file.authority_level.replaceAll('_', ' '))}</span>` : ''}
+                ${file.processing_status ? `<span class="chip">${esc(file.processing_status)}</span>` : ''}
+                ${file.video_status ? `<span class="chip">${esc(file.video_status)}</span>` : ''}
+                ${file.clarification_for ? `<span class="chip warn">${esc(file.clarification_for)}</span>` : ''}
+              </div>
             </div>
-            <div class="chip-row">
-              ${file.kind ? `<span class="chip brand">${esc(file.kind)}</span>` : ''}
-              ${file.processing_status ? `<span class="chip">${esc(file.processing_status)}</span>` : ''}
-              ${file.video_status ? `<span class="chip">${esc(file.video_status)}</span>` : ''}
-              <span class="chip">${esc(file.source || 'seeded')}</span>
-              ${file.clarification_for ? `<span class="chip warn">${esc(file.clarification_for)}</span>` : ''}
-            </div>
-            <div class="split-actions">
-              <button class="danger" onclick="removeUpload('${job.id}', '${jsSingleQuoted(uploadIdentity(file))}')">Remove</button>
-            </div>
+            ${renderSourceSetup(job, file)}
           </div>
         `).join('')}
       </div>`;
@@ -913,17 +1011,19 @@
       if (!transcripts.length) {
         return `<div class="empty">Transcripts will appear after audio is extracted and sent to the transcription provider.</div>`;
       }
-      const combinedText = transcripts.map(item => item.text || '').filter(Boolean).join('\\n\\n');
+      const draftingTranscripts = transcripts.filter(item => item.use_for_drafting);
+      const instructionSources = draftingTranscripts.length ? draftingTranscripts : transcripts.slice(0, 1);
+      const combinedText = instructionSources.map(item => item.text || '').filter(Boolean).join('\\n\\n');
       return `<div class="step-card">
         <div class="card-head">
           <div>
-            <div class="strong">Combined Transcript</div>
-            <div class="subtle">${transcripts.length} source${transcripts.length === 1 ? '' : 's'} compiled for this job</div>
+            <div class="strong">Instruction Transcript</div>
+            <div class="subtle">Drafting from ${instructionSources.map(item => esc(item.source_label || item.source_file)).join(', ')}. Alternate transcripts are retained for synchronization only.</div>
           </div>
           <span class="chip ${transcripts.every(item => item.status === 'complete') ? 'good' : 'warn'}">${transcripts.filter(item => item.status === 'complete').length}/${transcripts.length} complete</span>
         </div>
         <div class="chip-row" style="margin-bottom:8px">
-          ${transcripts.map(item => `<span class="chip ${transcriptStatusClass(item.status)}">${esc(item.source_file)}: ${esc(item.status)}</span>`).join('')}
+          ${transcripts.map(item => `<span class="chip ${transcriptStatusClass(item.status)}">${esc(item.source_label || item.source_file)}: ${esc(item.status)}${item.use_for_drafting ? ' · narration' : ''}${item.timeline_reference ? ' · reference' : ''}</span>`).join('')}
         </div>
         <div class="chip-row" style="margin-bottom:8px">
           ${transcripts.map(item => `<span class="chip">${esc(item.source_file)}: ${esc((item.words || []).length)} timed words</span>`).join('')}
@@ -1102,6 +1202,7 @@
               <button onclick="resumeCurrentStage('${job.id}')" ${processingActive ? 'disabled' : ''}>Resume Current</button>
               <button onclick="rerunJob('${job.id}')" ${processingActive ? 'disabled' : ''}>Rerun Job</button>
               <button onclick="rerunStage('${job.id}', 'transcription')" ${processingActive ? 'disabled' : ''}>Rerun Transcript</button>
+              <button onclick="rerunStage('${job.id}', 'drawings')" ${processingActive ? 'disabled' : ''}>Rerun Documents</button>
               <button onclick="rerunStage('${job.id}', 'video')" ${processingActive ? 'disabled' : ''}>Rerun Video</button>
               <button onclick="rerunStage('${job.id}', 'draft_sections')" ${processingActive ? 'disabled' : ''}>Rerun Drafts</button>
               <button onclick="rerunStage('${job.id}', 'media_assignment')" ${processingActive || !job.draft_sections.length ? 'disabled' : ''}>Rerun Media</button>
@@ -3136,6 +3237,7 @@
         || activeStageKey(job || {});
       const supported = {
         transcription: 'transcription',
+        drawings: 'drawings',
         video: 'video',
         draft_sections: 'draft_sections'
       };
@@ -3173,6 +3275,40 @@
       await loadData();
       invalidateRender();
       render(false);
+    }
+
+    function toggleSourceSyncFields(domId) {
+      const manual = document.getElementById(`source-sync-mode-${domId}`)?.value === 'manual';
+      document.querySelectorAll(`.source-manual-${domId}`).forEach(element => element.classList.toggle('hidden', !manual));
+    }
+
+    async function saveSourceSetup(jobId, sourceId, domId) {
+      const value = id => document.getElementById(id)?.value ?? '';
+      const checked = id => !!document.getElementById(id)?.checked;
+      const payload = {
+        identity: sourceId,
+        source_role: value(`source-role-${domId}`),
+        source_label: value(`source-label-${domId}`),
+        authority_level: value(`source-authority-${domId}`),
+        revision: value(`source-revision-${domId}`),
+        applicability: value(`source-applicability-${domId}`),
+        use_for_drafting: checked(`source-narration-${domId}`),
+        timeline_reference: checked(`source-reference-${domId}`),
+        sync_mode: value(`source-sync-mode-${domId}`),
+        start_source_seconds: value(`source-start-source-${domId}`),
+        start_timeline_seconds: value(`source-start-timeline-${domId}`),
+        end_source_seconds: value(`source-end-source-${domId}`),
+        end_timeline_seconds: value(`source-end-timeline-${domId}`)
+      };
+      try {
+        await api(`/api/jobs/${jobId}/source`, {method: 'POST', body: JSON.stringify(payload)});
+        toast('Source setup saved. Processing must be run again to apply it.');
+        await loadData();
+        invalidateRender();
+        render(false);
+      } catch (err) {
+        toast(`Source setup was not saved: ${err.message}`);
+      }
     }
 
     function openAddFiles(id) {

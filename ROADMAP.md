@@ -127,7 +127,9 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 - FFmpeg media probing and audio extraction.
 - OpenAI and local Whisper transcription paths with timestamp handling.
 - Transcript cue parsing and support for multiple aligned video sources.
+- Source-role, primary-narration, reference-timeline, manual-anchor, and clock-drift metadata.
 - Adaptive video sampling, OpenCV quality scoring, and candidate selection.
+- PDF page rendering, embedded-text extraction, scanned-page OCR, and page-level evidence records using local tools.
 - Draft questions and assembly-oriented section/step generation.
 - Section authoring, QA checks, media correction, package building, and print preview.
 - Processing logs and visible job-stage progress.
@@ -135,8 +137,9 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 ### Prototype Limitations
 
 - Assembly vocabulary and assumptions are embedded throughout processing and UI code.
-- Drawing/PDF OCR is not yet a complete production pipeline.
+- Drawing interpretation does not yet extract title blocks, revisions, BOM tables, callouts, or technical conflicts.
 - Uploaded still-image analysis is not yet a complete production pipeline.
+- Multi-angle automatic alignment currently uses transcript word matching; waveform and visual sync-marker alignment are not yet implemented.
 - Silent-video and weak-audio workflows need a deliberate segmentation strategy.
 - Background work uses in-process threads and is not durable across process restarts.
 - SQLite currently stores a large application-state document rather than normalized records.
@@ -220,7 +223,7 @@ Extract the product boundary without changing visible Assembly Assistant behavio
 
 ### Phase 2 - Real Supporting-Document Processing
 
-- Render PDF pages and extract OCR text with coordinates.
+- Render PDF pages and extract embedded/OCR text. **Initial local pipeline complete; coordinate-level extraction remains.**
 - Detect drawing title blocks, revision data, BOM tables, notes, and callouts where practical.
 - Extract text and structure from common office/text formats.
 - Analyze uploaded photographs and 3D render images.
