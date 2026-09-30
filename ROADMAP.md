@@ -127,7 +127,9 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 - FFmpeg media probing and audio extraction.
 - OpenAI and local Whisper transcription paths with timestamp handling.
 - Transcript cue parsing and support for multiple aligned video sources.
-- Source-role, primary-narration, reference-timeline, manual-anchor, and clock-drift metadata.
+- Source-role, primary-narration, reference-timeline, shared-audio alignment, manual-anchor, and clock-drift metadata.
+- Synthetic multi-angle media fixtures with known offsets, orientation, audible/visible markers, and scripted step times.
+- Versioned processing-run manifests with redacted settings, source configuration, stage outcomes, counts, and failures.
 - Adaptive video sampling, OpenCV quality scoring, and candidate selection.
 - PDF page rendering, embedded-text extraction, scanned-page OCR, and page-level evidence records using local tools.
 - Draft questions and assembly-oriented section/step generation.
@@ -139,7 +141,7 @@ See [Platform Architecture](docs/PLATFORM_ARCHITECTURE.md) for the extraction an
 - Assembly vocabulary and assumptions are embedded throughout processing and UI code.
 - Drawing interpretation does not yet extract title blocks, revisions, BOM tables, callouts, or technical conflicts.
 - Uploaded still-image analysis is not yet a complete production pipeline.
-- Multi-angle automatic alignment currently uses transcript word matching; waveform and visual sync-marker alignment are not yet implemented.
+- Multi-angle automatic alignment supports fixed offsets from shared audio and transcript words. Automatic waveform drift and visual-marker alignment are not yet implemented; manual end anchors correct drift.
 - Silent-video and weak-audio workflows need a deliberate segmentation strategy.
 - Background work uses in-process threads and is not durable across process restarts.
 - SQLite currently stores a large application-state document rather than normalized records.

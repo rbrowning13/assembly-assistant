@@ -20,7 +20,7 @@ Read the [roadmap](ROADMAP.md) for delivery phases, [project status](docs/PROJEC
 - Upload large videos and supporting source files with hashing and deduplication.
 - Extract audio with FFmpeg and transcribe through configured providers.
 - Retain transcript timing and use narration cues to guide step boundaries.
-- Assign source roles, choose one drafting narration, and align alternate camera timelines with automatic or manual anchors.
+- Assign source roles, choose one drafting narration, and align alternate camera timelines with shared-audio, transcript, or manual anchors.
 - Sample and score video frames with OpenCV and semantic analysis.
 - Render PDF pages, extract embedded text, OCR scanned pages when local tools are available, and retain page-level evidence.
 - Generate clarification questions and assembly-oriented draft sections.
@@ -34,7 +34,7 @@ Read the [roadmap](ROADMAP.md) for delivery phases, [project status](docs/PROJEC
 - The current drafting and QA behavior is intentionally assembly-oriented.
 - PDF rendering/text/OCR is implemented, but drawing title-block, revision, BOM, table, callout, and conflict interpretation is not complete.
 - Uploaded still images are available as authoring evidence but do not yet receive semantic analysis.
-- Multi-angle alignment supports transcript matching and manual drift anchors; audio-waveform and visual-marker alignment are not implemented yet.
+- Multi-angle alignment supports shared-audio offsets, transcript matching, and manual drift anchors; automatic waveform drift and visual-marker alignment are not implemented yet.
 - Background processing currently runs inside the Flask process and is not durable across a restart.
 - The application-state persistence model is suitable for local proving work, not yet for a multi-user production deployment.
 - Generated instructions require qualified human review.
@@ -56,6 +56,17 @@ Then open [http://127.0.0.1:8765](http://127.0.0.1:8765).
 - Tesseract is optional and is used to OCR rendered PDF pages that do not contain embedded text.
 - OpenCV and a configured transcription provider are required for the full processing path.
 - Local source files, generated media, logs, and credentials must remain excluded from version control.
+
+## Synthetic Validation
+
+Generate temporary landscape, portrait, alternate-angle, and voiceover fixtures with known synchronization metadata:
+
+```bash
+python3 tools/generate_sync_fixtures.py /tmp/assembly-sync-fixtures --offset 1.75 --scale 1.0
+python3 -m unittest discover -s tests -v
+```
+
+The generator writes no fixture media into the repository. Processing-run manifests record engine/profile versions, redacted configuration, source metadata, stage results, counts, alignment evidence, and failures for future runs.
 
 ## Development Rule
 

@@ -8,32 +8,36 @@ Prove and stabilize Assembly Assistant while creating a clean boundary for a reu
 
 ## Current Development Slice
 
-**Input foundation - implemented and awaiting representative media validation**
+**Input foundation and synthetic synchronization lab - implemented and awaiting representative media validation**
 
 - Stable source IDs and source roles.
 - One selected instruction-narration source to prevent duplicate multi-angle transcripts from affecting step boundaries.
 - One reference timeline per job.
 - Automatic fixed-offset alignment from shared timed transcript words.
+- Automatic fixed-offset alignment from shared audio waveforms, with confidence scoring and transcript fallback.
 - Manual start anchor and optional end anchor for clock-drift correction.
 - Source labels, authority, revision, and applicability metadata.
 - Real PDF rendering, embedded-text extraction, scanned-page OCR, and page-level evidence.
 - Supporting document context included in AI drafting with source-authority instructions.
 - Honest image-stage status: uploaded images are cataloged, but semantic still-image analysis remains pending.
 - Synthetic unit and isolated API tests for source defaults, offsets, drift, transcript selection, and text evidence.
+- Temporary FFmpeg fixtures for known offsets, portrait/landscape orientation, alternate angles, voiceover, audible/visible markers, and scripted step times.
+- Processing-run manifests containing engine/profile/prompt versions, redacted configuration, source setup, stage outcomes, timing, counts, alignment evidence, and failures.
+- Automated acceptance coverage confirms generated alternate-angle alignment within 0.5 seconds and preserves one drafting narration source.
 
 ## Next Authorized Work
 
 Work that does not require production recordings:
 
-1. Add audio-waveform alignment behind the existing timeline contract.
-2. Add synthetic FFmpeg video/audio fixtures with known offsets, drift, orientation, and sync markers.
-3. Add processing-run manifests with engine/profile/prompt/provider versions and stage metrics.
-4. Add document conflict and applicability scaffolding without making technical decisions automatically.
-5. Begin neutral `Source`, `EvidenceItem`, and `ProcessingRun` contracts alongside the existing saved format.
+1. Add document conflict and applicability scaffolding without making technical decisions automatically.
+2. Begin neutral `Source`, `EvidenceItem`, and `ProcessingRun` contracts alongside the existing saved format.
+3. Add semantic analysis for uploaded still images and rendered technical pages.
+4. Add visual sync-marker alignment as a fallback for silent or weak-audio multi-angle recordings.
 
 Work that should wait for representative media:
 
 - Tune automatic alignment confidence thresholds.
+- Validate fixed-offset waveform alignment against real shop-floor noise and decide whether automatic clock-drift fitting is justified.
 - Tune frame sampling and media assignment across camera angles.
 - Validate OCR quality on actual company drawings and scans.
 - Establish instruction-accuracy and media-acceptance baselines.

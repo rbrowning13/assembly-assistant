@@ -19,6 +19,8 @@ from pathlib import Path
 from urllib import error as urllib_error
 from urllib import request as urllib_request
 
+from assembly_assistant.sync import estimate_waveform_alignment, waveform_backend_available
+
 try:
     import cv2
 except Exception:
@@ -77,6 +79,10 @@ DOCUMENT_RENDER_TIMEOUT_SECONDS = 600
 DOCUMENT_OCR_PAGE_TIMEOUT_SECONDS = 120
 FRAME_MANIFEST_NAME = "frame_manifest.json"
 FRAME_MANIFEST_VERSION = 2
+PROCESSING_MANIFEST_VERSION = 1
+ENGINE_VERSION = "assembly-assistant-core-0.3"
+ASSEMBLY_PROFILE_VERSION = "assembly-1"
+INSTRUCTION_PROMPT_VERSION = "assembly-draft-1"
 ADAPTIVE_BASE_SAMPLE_RATES = {
     "fast": 1.0,
     "standard": 2.0,
@@ -686,6 +692,12 @@ def mark_interrupted_work(job):
             flags.append("Processing interrupted")
         job["last_activity"] = timestamp()
         recompute_progress(job)
+        if active_processing_manifest(job):
+            finish_job_processing_timing(
+                job,
+                status="interrupted",
+                outcome="Application restarted before processing completed.",
+            )
 
 
 def load_state():
@@ -1767,18 +1779,26 @@ def estimate_transcript_offset(reference_payload, candidate_payload):
     }
 
 
+def alignment_audio_path(file):
+    audio_rel = file.get("audio_path")
+    if audio_rel:
+        audio_path = APP_DIR / audio_rel
+        if audio_path.exists():
+            return audio_path
+    source_path = stored_path(file)
+    if source_path and source_path.exists() and file_kind(file) in TIMED_SOURCE_KINDS:
+        return source_path
+    return None
+
+
 def align_transcript_timelines(job):
+    """Align timed sources, preferring audio waveform evidence over text."""
     normalize_job_sources(job)
-    sources = []
-    for file in active_job_files(job):
-        if file.get("transcript_status") != "complete":
-            continue
-        payload = transcript_payload_for_file(file)
-        if not payload:
-            continue
-        if len(payload_word_tokens(payload, max_words=60)) < 20:
-            continue
-        sources.append((file, payload))
+    sources = [
+        (file, transcript_payload_for_file(file))
+        for file in active_job_files(job)
+        if file.get("kind") in TIMED_SOURCE_KINDS
+    ]
 
     if not sources:
         return []
@@ -1818,25 +1838,61 @@ def align_transcript_timelines(job):
                 "match_count": 0,
             })
             continue
-        estimate = estimate_transcript_offset(reference_payload, payload)
-        if estimate:
-            file["timeline_offset_seconds"] = estimate["offset_seconds"]
+
+        waveform_estimate = None
+        waveform_error = ""
+        reference_audio = alignment_audio_path(reference_file)
+        candidate_audio = alignment_audio_path(file)
+        if waveform_backend_available() and reference_audio and candidate_audio:
+            try:
+                waveform_estimate = estimate_waveform_alignment(reference_audio, candidate_audio)
+            except Exception as exc:
+                waveform_error = str(exc)[:500]
+        if waveform_estimate and waveform_estimate.get("confidence") in {"high", "medium"}:
+            file["timeline_offset_seconds"] = waveform_estimate["offset_seconds"]
+            file["timeline_scale"] = waveform_estimate.get("scale") or 1
+            file["timeline_alignment"] = {
+                "reference_file": reference_file.get("name"),
+                **waveform_estimate,
+            }
+            alignments.append({"source_file": file.get("name"), **file["timeline_alignment"]})
+            continue
+
+        transcript_estimate = None
+        if reference_payload and payload:
+            transcript_estimate = estimate_transcript_offset(reference_payload, payload)
+        if transcript_estimate:
+            file["timeline_offset_seconds"] = transcript_estimate["offset_seconds"]
             file["timeline_scale"] = 1
             file["timeline_alignment"] = {
                 "method": "transcript_word_match",
                 "reference_file": reference_file.get("name"),
-                **estimate,
+                **transcript_estimate,
             }
-            alignments.append({"source_file": file.get("name"), **estimate})
+            alignments.append({"source_file": file.get("name"), **file["timeline_alignment"]})
+            continue
+
+        reasons = []
+        if waveform_estimate:
+            reasons.append(
+                f"waveform confidence was low ({waveform_estimate.get('correlation', 0)} correlation)"
+            )
+        elif waveform_error:
+            reasons.append(f"waveform analysis failed: {waveform_error}")
+        elif not waveform_backend_available():
+            reasons.append("waveform backend is unavailable")
         else:
-            file["timeline_offset_seconds"] = float(file.get("timeline_offset_seconds") or 0)
-            file["timeline_scale"] = float(file.get("timeline_scale") or 1)
-            file["timeline_alignment"] = {
-                "method": "not_aligned",
-                "reference_file": reference_file.get("name"),
-                "confidence": "low",
-                "reason": "Not enough shared timed words to estimate an offset.",
-            }
+            reasons.append("shared source audio is unavailable")
+        reasons.append("not enough shared timed words")
+        file["timeline_offset_seconds"] = float(file.get("timeline_offset_seconds") or 0)
+        file["timeline_scale"] = float(file.get("timeline_scale") or 1)
+        file["timeline_alignment"] = {
+            "method": "not_aligned",
+            "reference_file": reference_file.get("name"),
+            "confidence": "low",
+            "reason": "; ".join(reasons) + ".",
+            "waveform_candidate": waveform_estimate or {},
+        }
     return alignments
 
 
@@ -2045,6 +2101,15 @@ def run_transcription_stage(job_id):
                         job,
                         f"Timeline aligned {alignment.get('source_file')} from manual anchors at {alignment.get('offset_seconds')}s offset{drift_note}.",
                     )
+                elif alignment.get("method") == "audio_waveform":
+                    add_log(
+                        job,
+                        (
+                            f"Timeline aligned {alignment.get('source_file')} from shared audio at "
+                            f"{alignment.get('offset_seconds')}s offset ({alignment.get('confidence')} confidence, "
+                            f"{alignment.get('correlation')} correlation)."
+                        ),
+                    )
                 else:
                     add_log(
                         job,
@@ -2159,9 +2224,119 @@ def start_job_processing_timing(job):
         "duration_seconds": None,
         "profile": processing_profile_key(job),
     }
+    normalize_job_sources(job)
+    run = {
+        "manifest_version": PROCESSING_MANIFEST_VERSION,
+        "run_id": short_id("run"),
+        "status": "running",
+        "started_at": datestamp(),
+        "started_epoch": now,
+        "ended_at": "",
+        "ended_epoch": None,
+        "duration_seconds": None,
+        "engine": {
+            "version": ENGINE_VERSION,
+            "profile_id": "assembly",
+            "profile_version": ASSEMBLY_PROFILE_VERSION,
+            "prompt_version": INSTRUCTION_PROMPT_VERSION,
+        },
+        "configuration": {
+            "processing_profile": processing_profile_key(job),
+            "expected_step_count": job.get("expected_step_count"),
+            "focus_area": job.get("focus_area") or "center",
+            "transcription_backend": SETTINGS.get("transcription_backend") or "auto",
+            "transcription_model": SETTINGS.get("transcription_model") or TIMESTAMPED_TRANSCRIPTION_MODEL,
+            "instruction_model": SETTINGS.get("instruction_model") or "gpt-4o-mini",
+            "transcription_enabled": bool(SETTINGS.get("transcription_enabled", True)),
+        },
+        "sources": [
+            {
+                "source_id": file.get("source_id") or "",
+                "name": file.get("name") or "",
+                "kind": file.get("kind") or file_kind(file),
+                "sha256": file.get("sha256") or "",
+                "bytes": int(file.get("bytes") or 0),
+                "source_role": file.get("source_role") or "",
+                "authority_level": file.get("authority_level") or "",
+                "revision": file.get("revision") or "",
+                "applicability": file.get("applicability") or "",
+                "use_for_drafting": bool(file.get("use_for_drafting")),
+                "timeline_reference": bool(file.get("timeline_reference")),
+            }
+            for file in active_job_files(job)
+        ],
+        "stages": {},
+        "metrics": {},
+        "failures": [],
+    }
+    runs = job.setdefault("processing_runs", [])
+    runs.append(run)
+    if len(runs) > 20:
+        del runs[:-20]
+    job["active_processing_run_id"] = run["run_id"]
 
 
-def finish_job_processing_timing(job):
+def active_processing_manifest(job):
+    run_id = job.get("active_processing_run_id")
+    return next(
+        (run for run in reversed(job.get("processing_runs") or []) if run.get("run_id") == run_id),
+        None,
+    )
+
+
+def refresh_processing_manifest(job, status=None, outcome=""):
+    run = active_processing_manifest(job)
+    if not run:
+        return None
+    run["status"] = status or run.get("status") or "running"
+    if outcome:
+        run["outcome"] = outcome
+    run["stages"] = {
+        key: {
+            "status": stage.get("status") or "idle",
+            "percent": stage.get("percent") or 0,
+            "note": stage.get("note") or "",
+            "duration_seconds": stage.get("duration_seconds"),
+        }
+        for key, stage in (job.get("stages") or {}).items()
+    }
+    run["source_alignments"] = [
+        {
+            "source_id": file.get("source_id") or "",
+            "name": file.get("name") or "",
+            "offset_seconds": float(file.get("timeline_offset_seconds") or 0),
+            "scale": float(file.get("timeline_scale") or 1),
+            "alignment": file.get("timeline_alignment") or {},
+        }
+        for file in active_job_files(job)
+        if file.get("kind") in TIMED_SOURCE_KINDS
+    ]
+    run["metrics"] = {
+        "files": len(active_job_files(job)),
+        "document_evidence": len(job.get("document_evidence") or []),
+        "transcript_sources": len(transcript_results(job)),
+        "timed_words": sum(len(item.get("words") or []) for item in transcript_results(job)),
+        "raw_frames": sum(len(file.get("frame_paths") or []) for file in active_job_files(job)),
+        "scored_frames": len(job.get("frame_analysis") or []),
+        "sections": len(job.get("draft_sections") or []),
+        "steps": sum(len(section.get("steps") or []) for section in job.get("draft_sections") or []),
+        "questions": len(job.get("questions") or []),
+        "qa_issues": int((job.get("draft_validation") or {}).get("issue_count") or 0),
+        "cache": json.loads(json.dumps(job.get("processing_cache") or {})),
+    }
+    run["failures"] = [
+        {
+            "stage": key,
+            "status": stage.get("status"),
+            "note": stage.get("note") or "",
+        }
+        for key, stage in (job.get("stages") or {}).items()
+        if stage.get("status") in {"failed", "blocked"}
+    ]
+    return run
+
+
+def finish_job_processing_timing(job, status="complete", outcome=""):
     timing = job.setdefault("processing_timing", {})
     now = epoch_now()
     started = float(timing.get("started_epoch") or now)
@@ -2169,6 +2344,14 @@ def finish_job_processing_timing(job):
     timing["ended_epoch"] = now
     timing["duration_seconds"] = round(max(0, now - started), 2)
     timing["profile"] = processing_profile_key(job)
+    run = refresh_processing_manifest(job, status=status, outcome=outcome)
+    if run:
+        run["ended_at"] = datestamp()
+        run["ended_epoch"] = now
+        run_started = float(run.get("started_epoch") or now)
+        run["duration_seconds"] = round(max(0, now - run_started), 2)
+        job["active_processing_run_id"] = ""
+    save_state()
 
 
 def unresolved_questions(job):
@@ -4313,6 +4496,8 @@ def make_job(name, product, work_area, station, profile="Standard", files=None, 
         "transcript_step_slices": [],
         "step_parse": {},
         "draft_sections": [],
+        "processing_runs": [],
+        "active_processing_run_id": "",
         "logs": [],
         "created_at": timestamp(),
         "last_activity": timestamp(),
@@ -4341,6 +4526,8 @@ def migrate_job_defaults(job):
     job.setdefault("draft_validation", {})
     job.setdefault("draft_audit", {})
     job.setdefault("processing_cache", {})
+    job.setdefault("processing_runs", [])
+    job.setdefault("active_processing_run_id", "")
     job.setdefault("watchdog", {})
     job.setdefault("last_activity_epoch", epoch_now())
     job.setdefault("expected_step_count", None)
@@ -6053,6 +6240,7 @@ def pause_for_transcript(job):
         job["flags"].append("Transcript required")
     set_stage(job, "questions", "blocked", 0, "Waiting for transcript")
     set_stage(job, "draft_sections", "blocked", 0, "Waiting for transcript")
+    refresh_processing_manifest(job, status="awaiting_input", outcome="Transcript required before drafting.")
     add_log(job, "Processing paused before questions: transcript text is not available.")
 
 
@@ -6592,7 +6780,7 @@ def mark_job_thread_failed(job_id, exc):
         flags = job.setdefault("flags", [])
         if "Processing error" not in flags:
             flags.append("Processing error")
-        finish_job_processing_timing(job)
+        finish_job_processing_timing(job, status="failed", outcome=message)
         recompute_progress(job)
         add_log(job, f"Processing error: {message}")
 
@@ -6633,13 +6821,21 @@ def start_processing(job_id, reset=True, first_run_only=False):
 
 def process_job(job_id):
     if not run_upload_check(job_id):
+        with STATE_LOCK:
+            finish_job_processing_timing(JOBS[job_id], status="failed", outcome="Upload validation failed.")
         return
     transcription_ready = run_transcription_stage(job_id)
     if not run_document_stage(job_id):
+        with STATE_LOCK:
+            finish_job_processing_timing(JOBS[job_id], status="failed", outcome="Document processing failed.")
         return
     if not run_image_inventory_stage(job_id):
+        with STATE_LOCK:
+            finish_job_processing_timing(JOBS[job_id], status="failed", outcome="Image inventory failed.")
         return
     if not run_video_stage(job_id):
+        with STATE_LOCK:
+            finish_job_processing_timing(JOBS[job_id], status="failed", outcome="Video processing failed.")
         return
 
     with STATE_LOCK:
@@ -6663,6 +6859,7 @@ def process_job(job_id):
         if pending_count:
             set_stage(job, "questions", "blocked", 50, f"{pending_count} decisions pending")
             job["status"] = "Questions Pending"
+            refresh_processing_manifest(job, status="awaiting_input", outcome="Clarification questions pending.")
             add_log(job, "Question pass paused for user decisions.")
         else:
             set_stage(job, "questions", "done", 100, "No decisions needed")
@@ -7416,6 +7613,7 @@ def job_processing_health(job):
 
 
 def job_summary(job):
+    latest_run = (job.get("processing_runs") or [{}])[-1]
     return {
         "id": job["id"],
         "job_no": job["job_no"],
@@ -7442,6 +7640,13 @@ def job_summary(job):
         "draft_audit": job.get("draft_audit") or {},
         "processing_cache": job.get("processing_cache") or {},
         "processing_timing": job.get("processing_timing") or {},
+        "latest_processing_run": {
+            "run_id": latest_run.get("run_id") or "",
+            "status": latest_run.get("status") or "",
+            "engine": latest_run.get("engine") or {},
+            "started_at": latest_run.get("started_at") or "",
+            "duration_seconds": latest_run.get("duration_seconds"),
+        },
         "processing_health": job_processing_health(job),
         "stages": job["stages"],
     }
